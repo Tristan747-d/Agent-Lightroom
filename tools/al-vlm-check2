@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""al-vlm-check2 —— 工序①/③ 的 VLM 复查通道（结构化 + 主体识别强化）。
+
+为什么单独做：
+  原 al-analyze --vlm 的提示词太笼统（"这是什么照片"），
+  导致**主体识别不明确**（用户批评第 6 条），进而：
+    · 主体在暗部却没提阴影（第 3/8 条）
+    · 肤色判断无依据（第 9 条）
+    · 不知道该保高光还是保阴影（第 5 条：调色思路不灵活）
+
+本工具的提示词强制模型回答**主体是谁/在哪/亮暗关系**，
+并要求给出**可执行的方向**（不是泛泛的"建议调整对比度"）。
+
+用法:
+    al-vlm-check2 /path/to/img.jpg            # 工序①：看前期状态
+    al-vlm-check2 /path/to/img.jpg --after    # 工序③：复查修完结果
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.request
+
+VLM = "http://127.0.0.1:8321/describe"
+
+# 工序①：看前期状态。强制主体识别 + 亮暗关系 + 可执行方向。
+PROMPT_BEFORE = """你是资深修图师。仔细看这张**修图前**的照片。
+【硬性要求】必须输出下面**全部**字段，一行一个，**一个都不许省略、不许合并、不许跳过**；
+每行格式固定为 `字段名: 内容`，即使不确定也要给出最接近的取值，不要写"无法判断"。
+带缩进说明的行（如 位置/依据/理由）必须跟在对应主字段之后。
+
+主题: <这张照片的主体内容归类，如 人像/合影/风光/活动记录/静物/文档>
+图片类型: <JPEG直出|相机RAW|手机拍摄|截图|扫描件|其他>   画质: <高|中|低>
+主体: <主体是什么（人/物/景），有几个>
+主体位置: <画面上/中/下/左/中/右；占画面比例大/中/小>
+主体明暗: <主体比背景亮|主体比背景暗|差不多>
+构图: <三分法|居中|对称|引导线|框架式|留白多|主体过小|主体被裁切|杂乱>   问题: <无|头顶空间不足|主体太靠边|背景干扰|水平失衡>
+内容: <一句话场景描述>
+曝光: <偏亮|适中|偏暗>
+高光: <有溢出风险|安全>   位置: <哪块区域最亮>
+阴影: <死黑|略沉|通透>   位置: <哪块区域最暗>
+对比: <偏低|适中|偏高>
+色彩情况: <过艳|正常|偏淡|偏灰>   主色调: <暖黄|冷蓝|绿|中性|其他>
+白平衡情况: <准确|偏黄|偏蓝|偏绿|偏品红>   依据: <肤色/白墙/天空等参照物>
+人物情况: <无人物|单人|多人合影|人像特写|人物较小>   人数: <几>
+表情: <无人物|自然放松|微笑|大笑|严肃|闭眼|眨眼|表情尴尬|张嘴说话|被遮挡>   眼神: <看镜头|看别处|无人物>
+肤色: <无人物|自然|偏黄|偏红|偏冷>
+焦点情况: <主体清晰|主体虚焦|整体模糊|局部虚焦>   焦点位置: <在哪>
+横平竖直: <是|否>   倾斜方向: <左倾|右倾|无>   倾斜程度: <轻微|明显>
+几何: <横平竖直|倾斜>   方向: <左倾|右倾|无>
+噪点可见性: <不可见|轻微|明显|严重>   区域: <暗部/天空/整体>
+缺陷: <无|噪点|污点|虚焦|过曝>   位置: <在哪>
+需要去朦胧: <是|否>   理由: <雾霾/逆光灰蒙/不需要>
+调色方向: <保高光|保阴影|均衡>   理由: <一句>
+优先动作: <你作为修图师第一步会动什么，要具体到部位>
+"""
+
+# 工序③：复查修完结果。对照 before 的目标逐项验收。
+PROMPT_AFTER = """你是资深修图师，正在**验收**一张刚修完的照片。
+【硬性要求】必须输出下面**全部**字段，一行一个，**一个都不许省略、不许合并、不许跳过**；
+每行格式固定为 `字段名: 内容`，即使不确定也要给出最接近的取值，不要写"无法判断"。
+
+主题: <主体内容归类，如 人像/合影/风光/活动记录/静物/文档>
+图片类型: <JPEG直出|相机RAW|手机拍摄|截图|扫描件|其他>
+主体: <主体是什么，是否清晰突出>
+构图: <合理|可改进>   问题: <无|主体过小|主体被裁切|背景干扰|水平失衡>
+曝光: <偏亮|适中|偏暗>
+高光: <保住|轻微溢出|明显溢出>
+阴影: <通透|略沉|死黑>
+对比: <偏低|适中|偏高>
+色彩情况: <过艳|正常|偏淡|偏灰>   主色调: <暖黄|冷蓝|绿|中性|其他>
+白平衡情况: <准确|偏黄|偏蓝|偏绿|偏品红>   依据: <肤色/白墙/天空等参照物>
+人物情况: <无人物|单人|多人合影|人像特写|人物较小>   人数: <几>
+表情: <无人物|自然放松|微笑|大笑|严肃|闭眼|眨眼|表情尴尬|张嘴说话|被遮挡>   眼神: <看镜头|看别处|无人物>
+肤色: <无人物|自然|偏黄|偏红|偏冷>
+焦点情况: <主体清晰|主体虚焦|整体模糊|局部虚焦>   焦点位置: <在哪>
+横平竖直: <是|否>   倾斜方向: <左倾|右倾|无>
+几何: <横平竖直|倾斜>
+噪点可见性: <不可见|轻微|明显|严重>
+缺陷: <无|噪点|污点|虚焦>
+主体突出度: <突出|一般|被背景抢戏>
+是否过修: <否|是>   理由: <一句>
+仍存在的问题: <无|具体问题>
+"""
+
+
+def ask(img, prompt, max_tokens=400):
+    body = json.dumps({"image": img, "prompt": prompt,
+                       "max_tokens": max_tokens}).encode()
+    req = urllib.request.Request(VLM, data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=900) as r:
+        return json.loads(r.read())["text"]
+
+
+def parse_lossless(text, keys):
+    """**无损解析**：保留 VLM 输出的**每一行**，一个字段都不许丢。
+
+    为什么必须无损（实测事故）：原实现 `if k in keys` 会把子字段全部丢弃——
+    VLM 实际返回 35 行，解析后只剩 22 行，`画质/主色调/依据/人数/焦点位置/
+    倾斜方向/倾斜程度/区域/位置/理由` 等 13 个子字段被**静默扔掉**。
+    更糟的是 `位置`、`理由`、`方向` 这类**重复出现的子字段名**会在 dict 里互相覆盖。
+
+    修法：
+      * 主字段（在 keys 里）→ 直接进 ordered dict；
+      * 子字段 → 归入**上一个主字段**名下（`_sub`），重复名自动加序号，绝不覆盖；
+      * 另存 `_lines` 保留原始行序，供人工核对与下游按需读取。
+    """
+    ordered = {}          # 主字段 → 值
+    subs = {}             # 主字段 → {子字段: 值}（列表保留重复）
+    lines = []
+    last = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lines.append(line)
+        if ":" not in line and "：" not in line:
+            continue
+        k, _, v = line.replace("：", ":").partition(":")
+        k, v = k.strip(), v.strip()
+        if not k:
+            continue
+        if k in keys:
+            ordered[k] = v
+            subs.setdefault(k, [])
+            last = k
+        elif last:
+            # 子字段：挂到上一个主字段下，重复名加序号（不覆盖）
+            subs[last].append((k, v))
+    return ordered, subs, lines
+
+
+BEFORE_KEYS = ("主题", "图片类型", "主体", "主体位置", "主体明暗", "构图", "内容", "曝光", "高光", "阴影",
+               "对比", "色彩情况", "白平衡情况", "人物情况", "表情", "肤色", "焦点情况", "噪点可见性", "横平竖直", "几何", "缺陷",
+               "需要去朦胧", "调色方向", "优先动作")
+AFTER_KEYS = ("主题", "图片类型", "主体", "构图", "曝光", "高光", "阴影", "对比", "色彩情况", "白平衡情况",
+              "人物情况", "表情", "肤色", "焦点情况", "噪点可见性", "横平竖直", "几何", "缺陷", "主体突出度", "是否过修", "仍存在的问题")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("image")
+    ap.add_argument("--after", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    prompt = PROMPT_AFTER if args.after else PROMPT_BEFORE
+    keys = AFTER_KEYS if args.after else BEFORE_KEYS
+    stage = "after" if args.after else "before"
+
+    # 文件存在性前置检查：VLM 服务对不存在的路径返回裸 HTTP 500，
+    # 完全没有信息量（实测踩到）。这里先自己判掉，给出可诊断的错误。
+    if not os.path.isfile(args.image):
+        print(json.dumps({"error": f"文件不存在: {args.image}"}, ensure_ascii=False))
+        return 1
+    try:
+        txt = ask(args.image, prompt)
+    except Exception as e:
+        print(json.dumps({"error": f"vlm: {e}"}, ensure_ascii=False))
+        return 1
+
+    ordered, subs, lines = parse_lossless(txt, keys)
+    rec = {"_stage": stage, "_image": args.image,
+           "fields": ordered, "subfields": subs,
+           "_lines": lines, "_raw": txt.strip()}
+
+    # 完整度自检：prompt 要求的字段是否全部返回（缺了必须报出来，不能静默省略）
+    missing = [k for k in keys if k not in ordered]
+
+    if args.json:
+        print(json.dumps(rec, ensure_ascii=False))
+    else:
+        print(f"[工序{'③复查' if args.after else '①看前期'}] {args.image}")
+        for k in keys:                      # 按 prompt 顺序，一个不落
+            if k in ordered:
+                print(f"  {k}: {ordered[k]}")
+            else:
+                print(f"  {k}: <缺失>")
+            for sk, sv in subs.get(k, []):  # 子字段紧随其后，全部输出
+                print(f"      {sk}: {sv}")
+        print(f"  [完整度] prompt 要求 {len(keys)} 字段，返回 {len(ordered)}，"
+              f"子字段 {sum(len(v) for v in subs.values())} 个")
+        if missing:
+            print(f"  [⚠️ 缺失字段] {', '.join(missing)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

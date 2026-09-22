@@ -1,0 +1,26 @@
+#!/bin/bash
+# al-vlm-check —— 一键验证「本地 VLM + 视觉算法」全链路。
+#
+# 它做四件事：
+#   1) 探测本机已下载的 VL 模型（~/Models 或 HF 缓存，名字含 vl/vision/llava 等）
+#   2) 若自研 VLM 服务没在跑，就在后台起来（stdlib HTTP + mlx_vlm，惰性加载）
+#   3) 等模型就绪（首次加载 4B 级约 5–30s）
+#   4) 跑 al-analyze --vlm：LR/原图 → 精确数值摘要 → 规则参数 → VLM 语义判断与有界修正
+#
+# 用法: tools/al-vlm-check [图片路径]      # 不给路径则用目录里最新一张
+set -uo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PORT="${AL_VLM_PORT:-8321}"
+ENDPOINT="http://127.0.0.1:${PORT}"
+
+if ! curl -s --max-time 2 "$ENDPOINT/health" 2>/dev/null | grep -q '"ok": *true'; then
+    echo "▸ 启动自研 VLM 服务（端口 ${PORT}）"
+    nohup "$DIR/al-vlm-server" --port "$PORT" >/tmp/al-vlm.log 2>&1 &
+    for i in $(seq 1 40); do
+        if curl -s --max-time 2 "$ENDPOINT/health" 2>/dev/null | grep -q '"ok": *true'; then break; fi
+        sleep 1
+    done
+fi
+curl -s --max-time 3 "$ENDPOINT/health" || { echo "✗ VLM 服务未就绪，见 /tmp/al-vlm.log"; exit 1; }
+echo
+"$DIR/al-analyze" ${1:+"$1"} --vlm

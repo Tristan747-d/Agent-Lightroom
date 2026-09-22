@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""al-vlm-scan —— 只读：让本地 VLM 逐张读用户修好的成品，抽取结构化方法论证据。
+
+绝对约束（用户明确要求）：
+  * **只读** —— catalog 以 mode=ro 打开；VLM 只接收渲染出的 JPEG；不写任何照片设置。
+  * **不用 CUA** —— 不点击、不操作任何界面。al-see 走的是 LR 预览缓存文件，
+    不是 UI 自动化。
+
+输出：/tmp/al-vlm-scan.jsonl（逐张一行，可断点续跑）
+
+为什么字段这么设计：
+  用户的 11 条批评里有几条（保高光/保阴影的指向性、肤色、废片排除）
+  光靠 develop 数值看不出来，必须**看图**才能验证。所以 prompt 直接
+  围绕这些争议点提问，并要求**固定选项 + 简短理由**，便于统计。
+"""
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CATALOG = os.path.expanduser("~/Pictures/Lightroom/AgentTest/AgentTest.lrcat")
+OUT = "/tmp/al-vlm-scan.jsonl"
+VLM = "http://127.0.0.1:8321/describe"
+
+# prompt 直接对准用户的 11 条批评，要求可统计的固定选项。
+PROMPT = """你是专业修图师。看这张已完成后期的照片，严格按格式回答，每项一行，不要客套：
+
+内容: <一句话说主体与场景>
+曝光: <偏亮|适中|偏暗>
+高光: <保住|轻微溢出|明显溢出>
+阴影: <通透|略沉|死黑>
+对比: <偏低|适中|偏高>
+肤色: <无人物|自然|偏黄|偏红|偏冷>
+影调取向: <保高光|保阴影|均衡>
+几何: <横平竖直|轻微倾斜|明显倾斜>
+缺陷: <无|噪点|污点|虚焦|过曝>,<无|...>
+后期痕迹: <轻|中|重>
+"""
+
+
+def see(name):
+    """渲染照片为 JPEG（走 LR 预览缓存，只读），返回路径。"""
+    try:
+        p = subprocess.run([os.path.join(HERE, "al-see"), name],
+                           capture_output=True, text=True, timeout=120)
+        line = (p.stdout or "").strip().splitlines()
+        if not line:
+            return None
+        return json.loads(line[-1]).get("file")
+    except Exception:
+        return None
+
+
+def develop(name):
+    """只读 catalog 取 develop 数值。"""
+    try:
+        con = sqlite3.connect(f"file:{CATALOG}?mode=ro", uri=True, timeout=15)
+        r = con.execute(
+            "select d.text from Adobe_imageDevelopSettings d "
+            "join Adobe_images i on i.id_local=d.image "
+            "join AgLibraryFile f on f.id_local=i.rootFile "
+            "where f.idx_filename=?", (name,)).fetchone()
+        pick = con.execute(
+            "select i.pick, i.rating from Adobe_images i "
+            "join AgLibraryFile f on f.id_local=i.rootFile "
+            "where f.idx_filename=?", (name,)).fetchone()
+        con.close()
+    except Exception:
+        return {}, None
+    if not r:
+        return {}, pick
+    txt = r[0]
+    dev = {k: float(v) for k, v in re.findall(r"(\w+) = (-?[0-9.]+)", txt)
+           if abs(float(v)) > 1e-9}
+    # 蒙版/污点修复的存在性（整块判断，非数值）
+    dev["_has_retouch"] = 1.0 if re.search(r"RetouchAreas|RemoveAreas", txt) else 0.0
+    dev["_has_mask"] = 1.0 if re.search(r'What = "Mask/', txt) else 0.0
+    return dev, pick
+
+
+def ask(img, prompt, max_tokens=300):
+    body = json.dumps({"image": img, "prompt": prompt,
+                       "max_tokens": max_tokens}).encode()
+    req = urllib.request.Request(VLM, data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=900) as r:
+        return json.loads(r.read())["text"]
+
+
+def parse(text):
+    """把 VLM 的固定格式回答解析成字段。"""
+    out = {}
+    for key in ("内容", "曝光", "高光", "阴影", "对比", "肤色",
+                "影调取向", "几何", "缺陷", "后期痕迹"):
+        m = re.search(rf"{key}\s*[:：]\s*(.+)", text)
+        if m:
+            out[key] = m.group(1).strip().split("\n")[0][:60]
+    out["_raw"] = text.strip()
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="并发数；MLX GPU 非线程安全，服务端有锁，>1 无收益")
+    args = ap.parse_args()
+
+    base = json.load(open("/tmp/al-agent-baseline.json"))
+    names = sorted(base)
+
+    done = set()
+    if os.path.exists(OUT):
+        for line in open(OUT):
+            try:
+                done.add(json.loads(line)["name"])
+            except Exception:
+                pass
+    todo = [n for n in names if n not in done]
+    if args.limit:
+        todo = todo[:args.limit]
+    print(f"待读 {len(todo)} / 共 {len(names)}（已完成 {len(done)}）", flush=True)
+
+    t0 = time.time()
+    ok = fail = 0
+    with open(OUT, "a") as fh:
+        for i, n in enumerate(todo, 1):
+            img = see(n)
+            dev, pick = develop(n)
+            rec = {"name": n, "develop": dev,
+                   "pick": (pick[0] if pick else None),
+                   "rating": (pick[1] if pick else None)}
+            if not img:
+                rec["error"] = "preview unavailable"
+                fail += 1
+            else:
+                try:
+                    rec["vlm"] = parse(ask(img, PROMPT))
+                    ok += 1
+                except Exception as e:
+                    rec["error"] = f"vlm: {e}"
+                    fail += 1
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fh.flush()
+            el = time.time() - t0
+            eta = (el / i) * (len(todo) - i)
+            print(f"[{i}/{len(todo)}] {n} {rec.get('vlm',{}).get('曝光','?')}"
+                  f"/{rec.get('vlm',{}).get('影调取向','?')}"
+                  f"  ok={ok} fail={fail} ETA {eta/60:.1f}min", flush=True)
+    print(f"\n完成 ok={ok} fail={fail} 用时 {(time.time()-t0)/60:.1f} min")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

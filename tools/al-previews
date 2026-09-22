@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""al-previews -- 批量把 Lightroom **已渲染的预览**导出成一个目录，供工作台显示。
+
+为什么要它（而不是插件 thumbs）：
+  * 插件路 `photo:requestJpegThumbnail` 在本机 LR 15.5 上 sync 形态返回空，
+    Async 形态每张要白等超时 —— 实测 169 张 **全部失败**（sent=0 failed=169）。
+  * LR 的预览缓存本身就是**标准 JPEG**（FFD8…FFD9），而且是 LR 渲染结果、
+    天然包含已应用的 develop 设定 —— 正是「预览必须是修图后的样子」要的东西。
+  * 本工具一次跑完把结果摊平到 /tmp/al-previews/<文件名>.jpg，
+    工作台直接按文件名读文件即可，零插件依赖、零轮询。
+
+映射要点（照抄 tools/al-see 的实测结论，勿自创）：
+  * 预览文件名前缀必须是 **AgLibraryFile.id_global**，
+    不是 Adobe_images.id_global（用后者查会「找不到预览」）。
+  * 文件名取 AgLibraryFile.idx_filename。
+  * 同一 UUID 可能有多个尺寸，取后缀数字最大者。
+
+用法:
+    tools/al-previews [--catalog X.lrcat] [--out /tmp/al-previews] [--clean]
+退出码: 0 = 至少导出一张；1 = 目录不可用 / 一张都没导出。
+"""
+import argparse
+import glob
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+
+PREVIEW_SIZES = re.compile(r"_(\d+)$")
+DEFAULT_OUT = "/tmp/al-previews"
+
+
+def lr_catalogs():
+    """找出 Lightroom 当前打开的 .lrcat（用 lsof）；失败则退回最近修改的候选。"""
+    found = []
+    try:
+        pids = subprocess.run(["pgrep", "-x", "Adobe Lightroom Classic"],
+                              capture_output=True, text=True, timeout=10).stdout.split()
+        for pid in pids:
+            out = subprocess.run(["lsof", "-p", pid], capture_output=True, text=True,
+                                 timeout=20).stdout
+            for line in out.splitlines():
+                if line.rstrip().endswith(".lrcat"):
+                    path = line.split()[-1]
+                    if path not in found:
+                        found.append(path)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if found:
+        return found
+    candidates = glob.glob(os.path.expanduser("~/Pictures/Lightroom/*/*.lrcat"))
+    candidates += glob.glob(os.path.expanduser("~/Pictures/*/*.lrcat"))
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates
+
+
+def all_files(catalog):
+    """列出目录里所有 (idx_filename, id_global)。"""
+    con = sqlite3.connect(f"file:{catalog}?mode=ro", uri=True, timeout=15)
+    try:
+        rows = con.execute(
+            "SELECT idx_filename, id_global FROM AgLibraryFile "
+            "WHERE id_global IS NOT NULL AND idx_filename IS NOT NULL"
+        ).fetchall()
+    finally:
+        con.close()
+    return rows
+
+
+def preview_file(preview_base, photo_uuid):
+    """在 Previews.lrdata 里找该 UUID 的最大尺寸预览文件。"""
+    hits = glob.glob(os.path.join(preview_base, "*", "*", photo_uuid + "-*"))
+    if not hits:
+        hits = glob.glob(os.path.join(preview_base, "**", photo_uuid + "-*"), recursive=True)
+    best, best_size = None, -1
+    for path in hits:
+        match = PREVIEW_SIZES.search(path)
+        size = int(match.group(1)) if match else 0
+        if size > best_size:
+            best, best_size = path, size
+    return best, best_size
+
+
+def main():
+    parser = argparse.ArgumentParser(description="批量导出 Lightroom 已渲染预览")
+    parser.add_argument("--catalog", help=".lrcat 路径（默认取 LR 当前打开的）")
+    parser.add_argument("--out", default=DEFAULT_OUT, help=f"输出目录（默认 {DEFAULT_OUT}）")
+    parser.add_argument("--clean", action="store_true", help="先清空输出目录")
+    args = parser.parse_args()
+
+    catalogs = [args.catalog] if args.catalog else lr_catalogs()
+    if not catalogs:
+        print("找不到 Lightroom 目录文件（可用 --catalog 指定）", file=sys.stderr)
+        return 1
+    catalog = catalogs[0]
+    preview_base = os.path.splitext(catalog)[0] + " Previews.lrdata"
+    if not os.path.isdir(preview_base):
+        print(f"预览缓存目录不存在：{preview_base}", file=sys.stderr)
+        return 1
+
+    if args.clean and os.path.isdir(args.out):
+        shutil.rmtree(args.out)
+    os.makedirs(args.out, exist_ok=True)
+
+    try:
+        rows = all_files(catalog)
+    except sqlite3.Error as exc:
+        print(f"读目录数据库失败：{exc}", file=sys.stderr)
+        return 1
+
+    exported, missing, bad = 0, 0, 0
+    for filename, uuid in rows:
+        src, size = preview_file(preview_base, uuid)
+        if not src:
+            missing += 1
+            continue
+        try:
+            with open(src, "rb") as handle:
+                head = handle.read(2)
+            if head != b"\xff\xd8":
+                bad += 1
+                continue
+            shutil.copyfile(src, os.path.join(args.out, filename + ".jpg"))
+            exported += 1
+        except OSError:
+            bad += 1
+            continue
+
+    print(f"catalog={catalog}")
+    print(f"导出 {exported} 张 → {args.out}（无预览 {missing}，非 JPEG {bad}，目录共 {len(rows)}）")
+    return 0 if exported else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

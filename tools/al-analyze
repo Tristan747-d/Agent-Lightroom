@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""al-analyze —— 「LLM 看懂照片并后期」算法的单一入口。
+
+链路（全部本机、离线、可解释）：
+
+    LR 预览缓存 ──al-see──▶ 已修图的 JPEG
+                              │
+                          al-vision（感知层：macOS Vision + CoreImage）
+                              │  曝光分布/溢出/白平衡/饱和度/锐度/人脸(含睁闭眼、人脸锐度)/
+                              │  显著主体/场景标签/文本密度(文档判定)/地平线/美学评分/人像分割
+                              ▼
+                          al-tune（决策层 L1：确定性规则 → Lightroom 参数 + 保/弃）
+                              │
+                          [可选] L2 LLM 语义层：给"这是什么/该不该留/风格意图"
+
+为什么这样设计（这是算法的核心主张）：
+  * 纯文本 LLM 无法看图，但**不需要**它看图——把图压成"语义+数值摘要"后，
+    LLM 靠摘要就能做判断；数值参数由**确定性规则**给出（可解释、可复现、不靠模型编数）。
+  * 这样即使本机只有 8B 级文本模型（gm 网关），也能完成"看懂 + 给参数"。
+  * 若将来接入本地视觉模型（如 MLX 上的 Qwen2.5-VL），只需替换"感知层"，
+    决策层与执行层不变——这是分层的价值。
+
+用法：
+    al-analyze --latest                 # 目录里最新一张（走 LR 预览缓存）
+    al-analyze "TKEI2153.JPG"           # 指定文件名
+    al-analyze /path/to/photo.jpg       # 直接给文件路径（跳过 LR）
+    al-analyze photo.jpg --llm          # 追加本地 LLM 语义层
+    al-analyze photo.jpg --json         # 只输出机器可读 JSON
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+VLM_ENDPOINT = "http://127.0.0.1:8321"
+
+# VLM 只允许在这几个参数上做**有界**修正（±MAX_TWEAK），且必须给出理由。
+# 依据：视觉模型擅长"这是什么/该往哪调"，但**不擅长给准确数值**——数值由确定性规则负责，
+# 模型越界就钳制，避免"8B 模型瞎编参数把照片调坏"。
+VLM_WHITELIST = {"Exposure2012", "Contrast2012", "Highlights2012", "Shadows2012",
+                 "Whites2012", "Blacks2012", "Vibrance", "Saturation",
+                 "Clarity2012", "Texture", "Dehaze"}
+MAX_TWEAK = 15
+
+
+# VLM 后端候选：自研服务优先，其次 LM Studio / Ollama（都是 OpenAI 兼容口），
+# 这样用户用哪种方式跑 Qwen-VL 都能直接接上，无需改算法。
+VLM_BACKENDS = [
+    ("http://127.0.0.1:8321", "local", "自研 al-vlm-server"),
+    ("http://127.0.0.1:1234", "openai", "LM Studio"),
+    ("http://127.0.0.1:11434", "openai", "Ollama"),
+]
+
+
+def _http_json(url, payload=None, timeout=10):
+    import urllib.request
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def detect_vlm(explicit=""):
+    """探测可用的 VLM 后端；(endpoint, kind, name, model_id) 或 None。"""
+    if explicit:
+        return (explicit.rstrip("/"), "openai" if ":8321" not in explicit else "local",
+                "显式指定", "")
+    for base, kind, name in VLM_BACKENDS:
+        try:
+            if kind == "local":
+                health = _http_json(base + "/health", timeout=3)
+                if health.get("ok"):
+                    return (base, kind, name, "")
+            else:
+                models = _http_json(base + "/v1/models", timeout=3)
+                ids = [m.get("id") for m in models.get("data", []) if m.get("id")]
+                # 只认视觉模型（名字里含 vl/vision/llava 等）
+                vision_ids = [i for i in ids if re.search(r"vl|vision|llava|pixtral|omni", i, re.I)]
+                if vision_ids:
+                    return (base, kind, name, vision_ids[0])
+        except Exception:
+            continue
+    return None
+
+
+def _image_data_uri(image, max_bytes=4_000_000):
+    """OpenAI 兼容后端要 base64 data URI；超过上限就先缩小（避免请求体过大）。"""
+    import base64
+    path = image
+    if os.path.getsize(path) > max_bytes:
+        small = "/tmp/al-vlm-small.jpg"
+        subprocess.run(["sips", "-s", "format", "jpeg", "-Z", "1280", path, "--out", small],
+                       capture_output=True)
+        if os.path.exists(small):
+            path = small
+    with open(path, "rb") as handle:
+        return "data:image/jpeg;base64," + base64.b64encode(handle.read()).decode()
+
+
+def vlm_layer(image, digest, decision, timeout=300, endpoint=""):
+    """让本地 VLM 看图给语义判断 + 有界修正；不可用/失败都不影响主流程。"""
+    backend = detect_vlm(endpoint)
+    if backend is None:
+        return {"error": "没有可用的本地 VLM（试过 8321 自研服务 / 1234 LM Studio / 11434 Ollama）"}
+    base, kind, name, model_id = backend
+    brief = {k: digest.get(k) for k in ("tone", "color", "sharpness", "labels", "text",
+                                        "faces", "subject", "horizon", "aesthetics")}
+    brief["person_segmentation"] = digest.get("person_segmentation")
+    prompt = (
+        "你在帮摄影师做后期。下面同时给你【照片】和【本机视觉算法测得的精确数值】。\n"
+        f"精确数值: {json.dumps(brief, ensure_ascii=False)[:2500]}\n"
+        f"规则给出的调参草稿: {json.dumps(decision['develop'], ensure_ascii=False)}\n"
+        "规则能看到数字但看不懂内容，你看得懂内容但测不准数字——请互补。\n"
+        "只输出 JSON，不要解释文字：\n"
+        '{"subject":"画面主体是什么","scene":"场景/光线条件","style_intent":"建议的后期风格倾向",'
+        '"keep":true/false,"defects":["你从图里看到的缺陷"],'
+        '"param_tweaks":{"参数名":数值}, "why":"为什么这样改（一句话）"}\n'
+        "param_tweaks 只允许这几个键：%s；且每项绝对值不超过 %d（这是对规则草稿的**增量**修正）。"
+        % (sorted(VLM_WHITELIST), MAX_TWEAK)
+    )
+    try:
+        if kind == "local":
+            text = _http_json(base + "/describe",
+                              {"image": image, "prompt": prompt, "max_tokens": 700},
+                              timeout=timeout).get("text", "")
+        else:
+            payload = {"model": model_id or "local-vlm", "max_tokens": 700, "temperature": 0.2,
+                       "messages": [{"role": "user", "content": [
+                           {"type": "text", "text": prompt},
+                           {"type": "image_url", "image_url": {"url": _image_data_uri(image)}},
+                       ]}]}
+            data = _http_json(base + "/v1/chat/completions", payload, timeout=timeout)
+            text = data["choices"][0]["message"]["content"]
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}", "backend": name}
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0:
+        return {"backend": name, "raw": text}
+    try:
+        parsed = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return {"backend": name, "raw": text}
+    applied, rejected = {}, []
+    for key, value in (parsed.get("param_tweaks") or {}).items():
+        if key not in VLM_WHITELIST or not isinstance(value, (int, float)):
+            rejected.append(f"{key}={value}")
+            continue
+        applied[key] = max(-MAX_TWEAK, min(MAX_TWEAK, int(value)))
+    parsed["param_tweaks_applied"] = applied
+    parsed["param_tweaks_rejected"] = rejected
+    parsed["backend"] = name
+    return parsed
+
+
+def merge_tweaks(decision, applied):
+    """把 VLM 的增量并入规则草稿（规则为基准，VLM 只做小幅修正）。"""
+    for key, delta in (applied or {}).items():
+        base = decision["develop"].get(key, 0)
+        decision["develop"][key] = round(base + delta)
+    return decision
+
+VISION = os.path.join(HERE, "al-vision")
+TUNE = os.path.join(HERE, "al-tune")
+SEE = os.path.join(HERE, "al-see")
+
+
+def run_json(cmd, stdin_text=None, retries=2):
+    """跑子命令并解析 JSON；空输出/解析失败时重试（Vision 首跑偶发空输出，已实测）。"""
+    last = ""
+    for _ in range(retries + 1):
+        proc = subprocess.run(cmd, input=stdin_text, capture_output=True, text=True)
+        last = proc.stdout.strip()
+        if last:
+            try:
+                return json.loads(last)
+            except json.JSONDecodeError:
+                pass
+    raise SystemExit(f"命令失败或无有效 JSON：{' '.join(cmd)}\n输出: {last[:300]}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("target", nargs="?", default="", help="文件名或图片路径；配合 --latest 可省略")
+    ap.add_argument("--latest", action="store_true", help="取 LR 目录里最新一张")
+    ap.add_argument("--llm", action="store_true", help="追加 LLM 语义层（本机 gm 网关）")
+    ap.add_argument("--vlm", action="store_true",
+                    help="用本地视觉模型（al-vlm-server）看图做语义判断+有界修正")
+    ap.add_argument("--json", action="store_true", help="只输出 JSON")
+    ap.add_argument("--quality", type=int, default=2048, help="预览长边（仅影响取图）")
+    args = ap.parse_args()
+
+    # 1) 取图：给了绝对路径就直接用；否则走 LR 预览缓存（= 修图后的渲染结果）
+    if args.target and os.path.isabs(args.target) and os.path.exists(args.target):
+        image, source = args.target, "direct-file"
+        photo_name = os.path.basename(args.target)
+    else:
+        see_cmd = [SEE] + ([] if args.target else ([] if args.latest else []))
+        if args.target:
+            see_cmd.append(args.target)
+        elif not args.latest:
+            # 未指定也没有 --latest 时，默认取最新一张（最常用）
+            pass
+        info = run_json(see_cmd)
+        image, source, photo_name = info["file"], info["source"], info.get("name", "")
+
+    # 2) 感知层
+    digest = run_json([VISION, image])
+
+    # 3) 决策层 L1（+ 可选 L2）
+    tune_cmd = [TUNE, "-"] + (["--llm"] if args.llm else [])
+    result = run_json(tune_cmd, stdin_text=json.dumps(digest))
+
+    if args.vlm:
+        vlm = vlm_layer(image, digest, result)
+        result["vlm"] = vlm
+        if "param_tweaks_applied" in vlm:
+            merge_tweaks(result, vlm["param_tweaks_applied"])
+
+    if args.json:
+        print(json.dumps({"photo": photo_name, "image": image, "image_source": source,
+                          "digest": digest, "decision": result}, ensure_ascii=False))
+        return 0
+
+    # 4) 人读报告
+    tone, color = digest["tone"], digest["color"]
+    faces, seg = digest["faces"], digest.get("person_segmentation", {})
+    print(f"照片   {photo_name}   {digest['width']}x{digest['height']}   （取图：{source}）")
+    print(f"曝光   均值 {tone['mean_luma']:.0f}/255   溢出 {tone['clipped_high_pct']:.2f}%   "
+          f"死黑 {tone['clipped_low_pct']:.2f}%   对比 {tone['contrast_std']:.0f}")
+    print(f"色彩   白平衡 R/G {color['wb_r_over_g']:.3f} B/G {color['wb_b_over_g']:.3f}   "
+          f"饱和度 {color['saturation_mean']:.3f}")
+    print(f"清晰   {digest['sharpness']['verdict']}（拉普拉斯方差 {digest['sharpness']['laplacian_var']:.0f}）"
+          f"   地平线 {digest['horizon']['angle_deg']:.2f}°")
+    print(f"主体   人脸 {faces['count']}   显著主体占比 {digest['subject']['coverage']:.2f}"
+          + (f"   主体/背景亮度 {seg.get('subject_luma', 0):.0f}/{seg.get('background_luma', 0):.0f}"
+             if seg else ""))
+    print(f"语义   标签 {[l['id'] for l in digest['labels'][:4]]}"
+          f"   美学 {digest.get('aesthetics', {}).get('overall_score', 'n/a')}"
+          f"   截图/文档 {digest.get('aesthetics', {}).get('is_utility', False) or digest['text']['is_document_like']}")
+
+    verdict_cn = {"keep": "保留", "reject": "排除", "review": "待人工复核"}[result["cull"]["verdict"]]
+    print(f"\n判定   {verdict_cn}" + ("（跳过修图：非摄影图片）" if result.get("skip_tuning") else ""))
+    for reason in result["cull"]["reasons"]:
+        print(f"       · {reason}")
+    if result["develop"] or result["crop"]:
+        print(f"\n修图   {json.dumps(result['develop'], ensure_ascii=False)}  {json.dumps(result['crop'], ensure_ascii=False)}")
+        for item in result["reasons"]:
+            print(f"       · {item['param']} = {item['value']}  ← {item['why']}")
+    for note in result["notes"]:
+        print(f"提示   {note}")
+    if "llm" in result:
+        print(f"\nLLM    {json.dumps(result['llm'], ensure_ascii=False)}")
+    if "vlm" in result:
+        print(f"\nVLM    {json.dumps(result['vlm'], ensure_ascii=False)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

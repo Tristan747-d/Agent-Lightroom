@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""al-vlm-server —— 本机视觉大模型（VLM）的极轻量 HTTP 服务。
+
+设计约束（遵循项目铁律）：
+  * 只用 Python 标准库 http.server，**不引 FastAPI/Flask 等重框架**，不起 Electron 壳；
+  * 推理在**本进程内**跑 mlx_vlm（GPU），模型**惰性加载**（服务秒起，首次请求才加载）；
+  * 单线程 + 锁：MLX GPU 不是线程安全的；
+  * 提供 OpenAI 兼容的 /v1/chat/completions（content 数组里带 image_url），
+    这样任何客户端（al-analyze、其它工具、DSH 的模型路由）都能直接用它看图。
+
+端点：
+  GET  /health               → {"ok":true,"model":...,"loaded":bool}
+  POST /describe             → {"image":"路径","prompt":"...","max_tokens":512} → {"text":"..."}
+  POST /v1/chat/completions  → OpenAI 形态（messages[].content[] 可含 image_url，支持 file:// 与 data:）
+
+用法：
+  tools/al-vlm-server                      # 自动探测已下载的 VL 模型
+  tools/al-vlm-server --model ~/Models/Qwen3-VL-4B-Instruct-4bit
+  tools/al-vlm-server --model <repo> --port 8321 --max-tokens 768
+  tools/al-vlm-server --mock               # 不加载模型，仅验证链路（返回提示回显）
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STATE = {"model": None, "processor": None, "config": None, "path": "", "mock": False, "loaded": False}
+LOCK = threading.Lock()
+
+
+def autodetect_model():
+    """找本机已下载的 VL 模型：优先 ~/Models 下名字含 VL 的目录，其次 HF 缓存快照。"""
+    candidates = []
+    models_dir = os.path.expanduser("~/Models")
+    if os.path.isdir(models_dir):
+        for name in os.listdir(models_dir):
+            path = os.path.join(models_dir, name)
+            if os.path.isdir(path) and re.search(r"vl|vision|llava|pixtral", name, re.I):
+                candidates.append(path)
+    hub = os.path.expanduser("~/.cache/huggingface/hub")
+    if os.path.isdir(hub):
+        for name in os.listdir(hub):
+            if not re.search(r"vl|vision|llava|pixtral", name, re.I):
+                continue
+            snapshots = os.path.join(hub, name, "snapshots")
+            if os.path.isdir(snapshots):
+                for snap in sorted(os.listdir(snapshots)):
+                    candidates.append(os.path.join(snapshots, snap))
+    for path in candidates:
+        if os.path.exists(os.path.join(path, "config.json")):
+            return path
+    return ""
+
+
+def ensure_loaded():
+    with LOCK:
+        if STATE["loaded"] or STATE["mock"]:
+            return
+        from mlx_vlm import load
+        from mlx_vlm.utils import load_config
+        print(f"[al-vlm] 加载模型 {STATE['path']} …", flush=True)
+        STATE["model"], STATE["processor"] = load(STATE["path"])
+        STATE["config"] = load_config(STATE["path"])
+        STATE["loaded"] = True
+        print("[al-vlm] 模型就绪", flush=True)
+
+
+# ⚠️ 实测性能根因（2026-09-22）：原实现把**原片全分辨率**直接喂给 mlx_vlm
+# （实测 4272×2848 / 5183×3455），视觉 token 数量爆炸 →
+#   * 单张推理 150–208 秒（一张图要 2–3 分钟，240 张要 2 小时+）
+#   * 显存/内存压力巨大：16GB 机器 free 掉到 5%、swap 用满 18.2/19.4GB，
+#     整个 job 被系统拖死（第 4 张耗时从 385s 暴涨到 845s）
+# 修法：送进模型前**按长边缩放**。VLM 判语义（是什么/什么表情/什么色偏）
+# 不需要全分辨率；缩到长边 VLM_MAX_EDGE 后视觉 token 与耗时呈平方级下降。
+# 只缩**临时副本**，绝不改动原片（遵循项目"只读原片"铁律）。
+VLM_MAX_EDGE = int(os.environ.get("VLM_MAX_EDGE", "1024"))
+
+
+def _downscale(src_path):
+    """把原片缩到长边 VLM_MAX_EDGE，返回临时文件路径；失败则返回原路径。
+
+    为什么要做：全分辨率喂 VLM 会让单张推理慢 5–10 倍并吃爆内存。
+    缩放不影响语义判断（VLM 只回答"这是什么/表情/色偏"这类问题），
+    但**测量类判断仍一律由 al-vision 在全分辨率上做**（skill 的语义/测量分工）。
+    """
+    try:
+        import subprocess
+        import tempfile
+        out = os.path.join(tempfile.gettempdir(),
+                           "al-vlm-scaled-%d.jpg" % os.getpid())
+        # sips 是 macOS 自带，无需额外依赖（与项目"不引重框架"一致）
+        r = subprocess.run(
+            ["sips", "-Z", str(VLM_MAX_EDGE), src_path, "--out", out],
+            capture_output=True, timeout=60)
+        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+            return out
+    except Exception:
+        pass
+    return src_path
+
+
+def describe(image_path, prompt, max_tokens):
+    if STATE["mock"]:
+        return f"[mock] 收到图片 {os.path.basename(image_path)}，提示词长度 {len(prompt)}"
+    ensure_loaded()
+    from mlx_vlm import generate
+    from mlx_vlm.prompt_utils import apply_chat_template
+    # 先缩图（只影响送模型的副本，原片不动）
+    work_path = _downscale(image_path)
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image", "image": work_path},
+    ]}]
+    formatted = apply_chat_template(STATE["processor"], STATE["config"], messages, num_images=1)
+    with LOCK:
+        result = generate(STATE["model"], STATE["processor"], formatted,
+                          image=[work_path], max_tokens=max_tokens, verbose=False)
+    text = getattr(result, "text", None)
+    return text if isinstance(text, str) else str(result)
+
+
+def data_uri_to_file(uri):
+    """把 data:image/...;base64,xxx 落成临时文件（供 mlx_vlm 读取）。"""
+    header, _, payload = uri.partition(",")
+    suffix = ".png" if "png" in header else ".jpg"
+    handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    handle.write(base64.b64decode(payload))
+    handle.close()
+    return handle.name
+
+
+def extract_image(message):
+    content = message.get("content")
+    if isinstance(content, str):
+        return None
+    for part in content or []:
+        if part.get("type") == "image_url":
+            url = (part.get("image_url") or {}).get("url", "")
+            if url.startswith("data:"):
+                return data_uri_to_file(url)
+            return url.replace("file://", "")
+        if part.get("type") == "image":
+            return part.get("image") or part.get("path")
+    return None
+
+
+def extract_text(message):
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    return "\n".join(p.get("text", "") for p in (content or []) if p.get("type") == "text")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):        # 静音默认访问日志，保持输出干净
+        pass
+
+    def _json(self, payload, code=200):
+        body = json.dumps(payload, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.startswith("/health"):
+            return self._json({"ok": True, "model": STATE["path"], "loaded": STATE["loaded"],
+                               "mock": STATE["mock"]})
+        if self.path.startswith("/v1/models"):
+            return self._json({"object": "list", "data": [{"id": "local-vlm", "object": "model",
+                                                           "owned_by": "local"}]})
+        self._json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            return self._json({"error": "invalid json"}, 400)
+
+        if self.path.startswith("/describe"):
+            image = body.get("image", "")
+            prompt = body.get("prompt", "描述这张照片。")
+            try:
+                text = describe(image, prompt, int(body.get("max_tokens", 512)))
+            except Exception as exc:
+                return self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            return self._json({"text": text})
+
+        if self.path.startswith("/v1/chat/completions"):
+            messages = body.get("messages", [])
+            image = next((extract_image(m) for m in messages if extract_image(m)), None)
+            prompt = "\n".join(extract_text(m) for m in messages if extract_text(m))
+            try:
+                text = describe(image, prompt, int(body.get("max_tokens", 512)))
+            except Exception as exc:
+                return self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
+            return self._json({
+                "object": "chat.completion", "model": body.get("model", "local-vlm"),
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                             "finish_reason": "stop"}],
+            })
+        self._json({"error": "not found"}, 404)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="", help="模型路径或 HF repo；省略=自动探测")
+    ap.add_argument("--port", type=int, default=8321)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--max-tokens", type=int, default=512)
+    ap.add_argument("--mock", action="store_true", help="不加载模型，仅验证链路")
+    args = ap.parse_args()
+
+    path = args.model or autodetect_model()
+    if not path and not args.mock:
+        print("✗ 没找到视觉模型。用 --model 指定，或先下载（如 mlx-community/Qwen2.5-VL-3B-Instruct-4bit）。"
+              "\n  也可以用 --mock 先验证链路。", file=sys.stderr)
+        return 1
+    STATE["path"] = path
+    STATE["mock"] = args.mock
+    print(f"[al-vlm] 服务启动 http://{args.host}:{args.port}  模型={path or '(mock)'}", flush=True)
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

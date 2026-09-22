@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""al-cmd —— 给 Agent Lightroom bridge 发一条命令，等插件的**终态**回报。
+
+为什么需要它（踩过的坑）：
+  * 插件对长任务会先回一条 "starting" 的 ack，再回终态。直接把第一个变化当结果
+    会拿到 ack（假成功）。
+  * LR 里可能有**多个轮询循环**（每次点「Start Bridge」菜单都会新起一个，旧循环
+    不会退出）。老代码的循环会把不认识的命令当成 "command received" 草草回掉。
+    因此这里支持 --expect：终态不符合预期就重发，让新循环有机会接住。
+
+用法:
+    al-cmd '{"type":"view","name":"AL_TEST_RED_01.jpg"}'
+    al-cmd '{"type":"probe"}' --expect ok,error --timeout 40 --attempts 6
+退出码: 0 = 拿到符合预期的终态回报; 1 = 超时/重试耗尽/桥接不可达。
+"""
+import argparse
+import hashlib
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+BASE = "http://127.0.0.1:8765"
+# 非终态：这些状态只是"收到了/开始了"，必须继续等。
+NON_TERMINAL = {"starting", "boot", "note", "viewing", "idle"}
+
+
+def http_json(path, payload=None, timeout=5):
+    url = BASE + path
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def signature(result):
+    return hashlib.sha1(json.dumps(result, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def wait_result(previous_seq, previous_sig, timeout, verbose):
+    """等 resultSeq 前进（老 bridge 回退到签名比较）后，返回其中的终态回报。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.4)
+        try:
+            health = http_json("/health")
+        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            continue
+        seq = health.get("resultSeq")
+        result = health.get("lastResult") or {}
+        is_new = (seq is not None and seq > previous_seq) or (
+            seq is None and signature(result) != previous_sig
+        )
+        status = result.get("status", "")
+        if not status or not is_new:
+            continue
+        if status in NON_TERMINAL:
+            if verbose:
+                print(f"  … {status}: {result.get('message','')}", file=sys.stderr)
+            # 非终态也是"新回报"：把基线推到当前，继续等真正的终态
+            previous_seq = seq if seq is not None else previous_seq
+            previous_sig = signature(result)
+            continue
+        return result
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("command", help="JSON 命令，例如 '{\"type\":\"view\"}'")
+    ap.add_argument("--expect", default="", help="期望的终态 status 列表（逗号分隔），不符则重发")
+    ap.add_argument("--timeout", type=float, default=30.0, help="每次尝试的等待秒数")
+    ap.add_argument("--attempts", type=int, default=4, help="重发次数上限（应对多轮询循环竞争）")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    try:
+        command = json.loads(args.command)
+    except json.JSONDecodeError as exc:
+        print(f"命令不是合法 JSON: {exc}", file=sys.stderr)
+        return 2
+
+    expect = [s.strip() for s in args.expect.split(",") if s.strip()]
+    verbose = not args.quiet
+
+    for attempt in range(1, args.attempts + 1):
+        try:
+            health = http_json("/health")
+        except (urllib.error.URLError, OSError) as exc:
+            print(f"bridge 不可达（{exc}）——先确认 com.agentlightroom.bridge 在跑", file=sys.stderr)
+            return 1
+        previous_seq = health.get("resultSeq") or 0
+        previous_sig = signature(health.get("lastResult") or {})
+
+        try:
+            http_json("/command", command)
+        except (urllib.error.URLError, OSError) as exc:
+            print(f"命令入队失败: {exc}", file=sys.stderr)
+            return 1
+
+        if verbose and attempt > 1:
+            print(f"  重发第 {attempt} 次（可能被旧轮询循环抢走了）", file=sys.stderr)
+        result = wait_result(previous_seq, previous_sig, args.timeout, verbose)
+        if result is None:
+            if verbose:
+                print(f"  第 {attempt} 次尝试超时（{args.timeout}s）", file=sys.stderr)
+            continue
+
+        status = result.get("status", "")
+        if expect and status not in expect:
+            if verbose:
+                print(f"  终态 {status} 不在预期 {expect} 内 → 重试", file=sys.stderr)
+            continue
+
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    print("重试耗尽：没有拿到符合预期的终态回报", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""al-see —— 让 agent 直接「看见」Lightroom 里的照片。
+
+两条路，优先用不依赖插件的那条：
+
+  ① 预览缓存路（默认，零插件依赖，已验证可用）
+     Lightroom 把每张照片的**渲染结果**（含基础修图：曝光/Upright/白平衡…）
+     写成 JPEG 存进 `<catalog> Previews.lrdata/<X>/<XXXX>/<UUID>-<hash>_<尺寸>`。
+     这些文件本身就是标准 JPEG（FFD8…FFD9），直接拷出来 agent 就能看。
+     文件名 ↔ 照片的映射从 catalog 的 SQLite 里查：
+         Adobe_images.rootFile → AgLibraryFile.id_local（idx_filename）
+         Adobe_images.id_global = 照片 UUID，正是预览文件名的前缀。
+     这条路满足「选片预览必须是 Lr 内基础编辑完成后的预览」——因为预览就是 LR 渲染的。
+
+  ② 插件文件通道（备路，需要插件**新代码**已载入）
+     /tmp/al-view.request → 插件渲染 → /tmp/al-view.response。
+     该通道绕开 /next 命令队列，避免被 LR 里**上一代旧轮询循环**抢走命令
+     （每次点 Start Bridge 都会多起一个循环，旧循环不会退出）。
+
+用法：
+    al-see                                # 目录里最新的一张
+    al-see "AL_TEST_RED_01.jpg"
+    al-see --catalog ~/Pictures/Lightroom/AgentTest/AgentTest.lrcat --name x.heic
+    al-see --plugin                       # 强制走插件通道
+输出（stdout，一行 JSON）：
+    {"file": "...", "name": ..., "uuid": ..., "source": "preview-cache|plugin-channel",
+     "width": ..., "height": ..., "bytes": ...}
+退出码：0 成功 / 1 失败。
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid as uuidlib
+
+OUT = "/tmp/agent-lightroom-view.jpg"
+REQUEST = "/tmp/al-view.request"
+RESPONSE = "/tmp/al-view.response"
+PREVIEW_SIZES = re.compile(r"_(\d+)$")
+
+
+def lr_catalogs():
+    """找出 Lightroom 当前打开的 .lrcat（用 lsof）；失败则退回"最近修改的候选"。"""
+    found = []
+    try:
+        pids = subprocess.run(["pgrep", "-x", "Adobe Lightroom Classic"],
+                              capture_output=True, text=True, timeout=10).stdout.split()
+        for pid in pids:
+            out = subprocess.run(["lsof", "-p", pid], capture_output=True, text=True,
+                                 timeout=20).stdout
+            for line in out.splitlines():
+                if line.rstrip().endswith(".lrcat"):
+                    path = line.split()[-1]
+                    if path not in found:
+                        found.append(path)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if found:
+        return found
+    candidates = glob.glob(os.path.expanduser("~/Pictures/Lightroom/*/*.lrcat"))
+    candidates += glob.glob(os.path.expanduser("~/Pictures/*/*.lrcat"))
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates
+
+
+def resolve_photo(catalog, name):
+    """文件名 → (文件名, 预览用的 UUID)。
+
+    ⚠️ 实测（2026-09-19）：预览文件名前缀是 **AgLibraryFile.id_global**，
+    不是 Adobe_images.id_global（后者是照片本身的 UUID，用它查会「找不到预览」）。
+    """
+    con = sqlite3.connect(f"file:{catalog}?mode=ro", uri=True, timeout=10)
+    try:
+        if name:
+            row = con.execute(
+                "SELECT idx_filename, id_global FROM AgLibraryFile WHERE idx_filename = ?",
+                (name,)).fetchone()
+            return (row[0], row[1]) if row else (None, None)
+        row = con.execute(
+            "SELECT f.idx_filename, f.id_global FROM AgLibraryFile f "
+            "JOIN Adobe_images i ON i.rootFile = f.id_local "
+            "WHERE f.id_global IS NOT NULL ORDER BY i.captureTime DESC LIMIT 1").fetchone()
+        return (row[0], row[1]) if row else (None, None)
+    finally:
+        con.close()
+
+
+def preview_file(catalog, photo_uuid):
+    """在 Previews.lrdata 里找该 UUID 的最大尺寸预览文件。"""
+    base = os.path.splitext(catalog)[0] + " Previews.lrdata"
+    hits = glob.glob(os.path.join(base, "*", "*", photo_uuid + "-*"))
+    if not hits:
+        hits = glob.glob(os.path.join(base, "**", photo_uuid + "-*"), recursive=True)
+    best, best_size = None, -1
+    for path in hits:
+        match = PREVIEW_SIZES.search(path)
+        size = int(match.group(1)) if match else 0
+        if size > best_size:
+            best, best_size = path, size
+    return best, best_size
+
+
+def image_size(path):
+    """用 macOS 自带 sips 读像素尺寸。"""
+    try:
+        out = subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", path],
+                             capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    width = height = None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("pixelWidth:"):
+            width = int(line.split(":")[1])
+        elif line.startswith("pixelHeight:"):
+            height = int(line.split(":")[1])
+    return width, height
+
+
+def via_preview_cache(catalog, name):
+    if not catalog or not os.path.exists(catalog):
+        print("找不到 Lightroom 目录文件（可用 --catalog 指定）", file=sys.stderr)
+        return None
+    filename, photo_uuid = resolve_photo(catalog, name)
+    if not photo_uuid:
+        print(f"目录里没有这张照片：{name or '(任何照片)'}", file=sys.stderr)
+        return None
+    src, size = preview_file(catalog, photo_uuid)
+    if not src:
+        print(f"预览缓存里没有 {photo_uuid} 的渲染结果（LR 尚未生成预览）", file=sys.stderr)
+        return None
+    with open(src, "rb") as handle:
+        data = handle.read()
+    if not data.startswith(b"\xff\xd8"):
+        print(f"预览文件不是 JPEG（{src}），改用插件通道", file=sys.stderr)
+        return None
+    with open(OUT, "wb") as handle:
+        handle.write(data)
+    width, height = image_size(OUT)
+    return {"file": OUT, "name": filename, "uuid": photo_uuid, "source": "preview-cache",
+            "preview_px": size, "width": width, "height": height, "bytes": len(data)}
+
+
+def via_plugin_channel(name, size, timeout):
+    token = uuidlib.uuid4().hex
+    try:
+        os.remove(RESPONSE)
+    except FileNotFoundError:
+        pass
+    tmp = REQUEST + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(f"{token}\n{size}\n{name or ''}\n")
+    os.replace(tmp, REQUEST)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            with open(RESPONSE, "r", encoding="utf-8") as handle:
+                lines = [line.rstrip("\n") for line in handle]
+        except FileNotFoundError:
+            continue
+        if len(lines) < 2 or lines[0] != token:
+            continue
+        if lines[1] != "view":
+            print(f"插件渲染失败：{lines[1]}: {lines[2] if len(lines) > 2 else ''}", file=sys.stderr)
+            return None
+        parts = (lines[2] if len(lines) > 2 else "").split("|")
+        path = parts[1] if len(parts) > 1 else OUT
+        width, height = image_size(path)
+        return {"file": path, "name": parts[0] if parts else name, "uuid": None,
+                "source": "plugin-channel", "channel": parts[3] if len(parts) > 3 else "",
+                "width": width, "height": height, "bytes": os.path.getsize(path)}
+    print("插件通道超时（插件新代码未载入时属预期）", file=sys.stderr)
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("name", nargs="?", default="", help="照片文件名；省略 = 目录里最新一张")
+    ap.add_argument("--name", dest="name_opt", default="", help="同上（具名参数写法）")
+    ap.add_argument("--catalog", default="", help="指定 .lrcat；默认自动探测")
+    ap.add_argument("--size", type=int, default=1600, help="插件通道的长边像素")
+    ap.add_argument("--timeout", type=float, default=20.0)
+    ap.add_argument("--plugin", action="store_true", help="强制走插件文件通道")
+    args = ap.parse_args()
+    name = args.name_opt or args.name
+
+    result = None
+    if not args.plugin:
+        catalog = args.catalog
+        if not catalog:
+            candidates = lr_catalogs()
+            catalog = candidates[0] if candidates else ""
+        result = via_preview_cache(catalog, name)
+        if result is None:
+            print("→ 回退到插件通道", file=sys.stderr)
+    if result is None:
+        result = via_plugin_channel(name, args.size, args.timeout)
+    if result is None:
+        return 1
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

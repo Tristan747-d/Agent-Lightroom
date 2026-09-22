@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""al-tune —— 把 al-vision 的视觉摘要变成 Lightroom 后期参数与保/弃判定。
+
+这是「LLM 看懂照片并后期」算法的**决策层**，分两级：
+
+  L1 确定性映射（本文件，无 AI、可解释、可复现）
+     视觉摘要里的每个数字都有明确的触发阈值与对应参数，
+     每条参数都带 why（为什么这么调），便于人工复核与事后审计。
+     这样做的理由：小模型（本机 8B 级）不适合直接编数值；数值必须由规则给。
+
+  L2 LLM 语义层（可选，--llm）
+     把摘要 + L1 草稿交给 LLM，让它回答需要「理解内容」的问题：
+     这是什么照片、该不该留、风格意图、是否要人像处理、是否要局部蒙版。
+     LLM 只做**判断与意图**，数值仍以 L1 为准并可小幅修正。
+
+用法：
+    al-tune <digest.json>              # 读 al-vision 的输出
+    al-vision x.jpg | al-tune -        # 管道
+    al-tune digest.json --llm          # 追加 LLM 语义层（走本机 gm 网关）
+输出：一行 JSON {develop, cull, reasons, notes}
+"""
+import argparse
+import json
+import sys
+
+# ── 阈值与上限（集中放置，便于按审美习惯调）──────────────────────────────
+TARGET_MEAN_LUMA = 52.0      # 目标中间调亮度（0-255）
+BLURRY_LAPLACIAN = 30.0      # 低于此视为糊片
+SOFT_LAPLACIAN = 120.0       # 低于此视为偏软
+FACE_SHARP_FLOOR = 25.0      # 人脸区域锐度下限（主体/眼睛合焦代理）
+CLIP_HIGH_TOL = 1.0          # 高光溢出容忍（%）
+CLIP_LOW_TOL = 2.0           # 暗部死黑容忍（%）
+LOW_CONTRAST_STD = 40.0      # 对比度(RMS)偏低
+HIGH_CONTRAST_STD = 72.0     # 对比度偏高
+SAT_LOW = 0.12               # 饱和度过低（灰）
+SAT_HIGH = 0.45              # 饱和度过高
+WB_TOL = 0.06                # 白平衡偏移容忍
+HORIZON_TOL = 0.5            # 地平线倾角容忍（度）
+BG_BRIGHT_DELTA = -25.0      # 背景比主体亮多少算"背景抢戏"
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def decide(digest):
+    develop, reasons, notes = {}, [], []
+
+    tone = digest.get("tone", {})
+    color = digest.get("color", {})
+    sharp = digest.get("sharpness", {})
+    text = digest.get("text", {})
+    faces = digest.get("faces", {})
+    subject = digest.get("subject", {})
+    horizon = digest.get("horizon", {})
+    aesthetics = digest.get("aesthetics", {})
+    seg = digest.get("person_segmentation", {})
+
+    mean_luma = tone.get("mean_luma", 0.0)
+    p5, p95 = tone.get("p5", 0.0), tone.get("p95", 0.0)
+    clip_hi, clip_lo = tone.get("clipped_high_pct", 0.0), tone.get("clipped_low_pct", 0.0)
+    contrast = tone.get("contrast_std", 0.0)
+    lap = sharp.get("laplacian_var", 0.0)
+
+    is_utility = bool(aesthetics.get("is_utility", False)) or bool(text.get("is_document_like", False))
+
+    # ── 曝光 ────────────────────────────────────────────────────────────
+    if mean_luma and mean_luma < 45:
+        ev = clamp((TARGET_MEAN_LUMA - mean_luma) / TARGET_MEAN_LUMA * 0.9, 0.05, 1.20)
+        develop["Exposure2012"] = round(ev, 2)
+        reasons.append({"param": "Exposure2012", "value": round(ev, 2),
+                        "why": f"中间调偏暗（均值 {mean_luma:.0f}/255 < 45），提亮 {ev:+.2f} EV"})
+    elif mean_luma > 160:
+        ev = clamp(-(mean_luma - 150) / 105 * 0.9, -1.00, -0.05)
+        develop["Exposure2012"] = round(ev, 2)
+        reasons.append({"param": "Exposure2012", "value": round(ev, 2),
+                        "why": f"中间调偏亮（均值 {mean_luma:.0f} > 160），压暗 {ev:+.2f} EV"})
+
+    # ── 高光 / 白色色阶（救回溢出）─────────────────────────────────────
+    if clip_hi > CLIP_HIGH_TOL:
+        hi = -clamp(18 + (clip_hi - CLIP_HIGH_TOL) * 12, 10, 65)
+        develop["Highlights2012"] = round(hi)
+        reasons.append({"param": "Highlights2012", "value": round(hi),
+                        "why": f"高光溢出 {clip_hi:.2f}%（容忍 {CLIP_HIGH_TOL}%），压高光救细节"})
+        if clip_hi > 3.0:
+            wh = -clamp((clip_hi - 3.0) * 6, 5, 25)
+            develop["Whites2012"] = round(wh)
+            reasons.append({"param": "Whites2012", "value": round(wh),
+                            "why": f"溢出较严重（{clip_hi:.2f}%），再收白色色阶"})
+
+    # ── 阴影 / 黑色色阶（救回死黑）─────────────────────────────────────
+    if clip_lo > CLIP_LOW_TOL:
+        sh = clamp(15 + (clip_lo - CLIP_LOW_TOL) * 6, 10, 60)
+        develop["Shadows2012"] = round(sh)
+        reasons.append({"param": "Shadows2012", "value": round(sh),
+                        "why": f"暗部死黑 {clip_lo:.2f}%，提阴影救细节"})
+        if clip_lo > 8.0:
+            bl = clamp((clip_lo - 8.0) * 2.5, 5, 25)
+            develop["Blacks2012"] = round(bl)
+            reasons.append({"param": "Blacks2012", "value": round(bl),
+                            "why": f"死黑面积大（{clip_lo:.2f}%），抬黑色色阶"})
+
+    # ── 两端是否"没吃满"：补白场/黑场 ───────────────────────────────────
+    if p95 and p95 < 180 and clip_hi <= CLIP_HIGH_TOL:
+        wh = clamp((190 - p95) * 0.35, 3, 20)
+        develop["Whites2012"] = round(develop.get("Whites2012", 0) + wh)
+        reasons.append({"param": "Whites2012", "value": develop["Whites2012"],
+                        "why": f"亮部没吃满（P95 {p95:.0f} < 180），提白色色阶增强通透"})
+    if p5 and p5 > 40 and clip_lo <= CLIP_LOW_TOL:
+        bl = -clamp((p5 - 35) * 0.4, 2, 15)
+        develop["Blacks2012"] = round(develop.get("Blacks2012", 0) + bl)
+        reasons.append({"param": "Blacks2012", "value": develop["Blacks2012"],
+                        "why": f"暗部发灰（P5 {p5:.0f} > 40），压黑色色阶找回黑位"})
+
+    # ── 对比度 ──────────────────────────────────────────────────────────
+    if contrast and contrast < LOW_CONTRAST_STD:
+        c = clamp((LOW_CONTRAST_STD - contrast) * 0.9, 5, 28)
+        develop["Contrast2012"] = round(c)
+        reasons.append({"param": "Contrast2012", "value": round(c),
+                        "why": f"整体发平（RMS {contrast:.0f} < {LOW_CONTRAST_STD:.0f}），加对比"})
+    elif contrast > HIGH_CONTRAST_STD:
+        c = -clamp((contrast - HIGH_CONTRAST_STD) * 0.5, 3, 15)
+        develop["Contrast2012"] = round(c)
+        reasons.append({"param": "Contrast2012", "value": round(c),
+                        "why": f"反差偏硬（RMS {contrast:.0f} > {HIGH_CONTRAST_STD:.0f}），略收对比"})
+
+    # ── 色彩 ────────────────────────────────────────────────────────────
+    sat = color.get("saturation_mean", 0.0)
+    if sat and sat < SAT_LOW:
+        v = clamp((SAT_LOW - sat) * 120, 5, 30)
+        develop["Vibrance"] = round(v)
+        reasons.append({"param": "Vibrance", "value": round(v),
+                        "why": f"色彩寡淡（饱和度 {sat:.3f} < {SAT_LOW}），提鲜艳度（优先于饱和度，护肤色）"})
+    elif sat > SAT_HIGH:
+        v = -clamp((sat - SAT_HIGH) * 60, 3, 20)
+        develop["Vibrance"] = round(v)
+        reasons.append({"param": "Vibrance", "value": round(v),
+                        "why": f"色彩过艳（{sat:.3f} > {SAT_HIGH}），略降鲜艳度"})
+
+    rg, bg = color.get("wb_r_over_g", 1.0), color.get("wb_b_over_g", 1.0)
+    if rg - 1 > WB_TOL:
+        develop["Tint"] = round(develop.get("Tint", 0) - clamp((rg - 1 - WB_TOL) * 120, 2, 15))
+        reasons.append({"param": "Tint", "value": develop["Tint"],
+                        "why": f"偏红（R/G {rg:.3f}），往绿侧微调"})
+    elif 1 - rg > WB_TOL:
+        develop["Tint"] = round(develop.get("Tint", 0) + clamp((1 - rg - WB_TOL) * 120, 2, 15))
+        reasons.append({"param": "Tint", "value": develop["Tint"], "why": f"偏青（R/G {rg:.3f}），往品红侧微调"})
+    if bg - 1 > WB_TOL:
+        develop["TemperatureDelta"] = -clamp((bg - 1 - WB_TOL) * 1200, 50, 400)   # 增量，落库时叠加原片色温
+        reasons.append({"param": "TemperatureDelta", "value": develop["TemperatureDelta"],
+                        "why": f"偏蓝（B/G {bg:.3f}），降色温去蓝"})
+    elif 1 - bg > WB_TOL:
+        develop["TemperatureDelta"] = clamp((1 - bg - WB_TOL) * 1200, 50, 400)
+        reasons.append({"param": "TemperatureDelta", "value": develop["TemperatureDelta"],
+                        "why": f"偏黄（B/G {bg:.3f}），升色温去黄"})
+
+    # ── 清晰度 / 质感 ───────────────────────────────────────────────────
+    if SOFT_LAPLACIAN > lap > BLURRY_LAPLACIAN:
+        develop["Clarity2012"] = 8
+        develop["Texture"] = 6
+        reasons.append({"param": "Clarity2012/Texture", "value": "8/6",
+                        "why": f"锐度偏软（拉普拉斯方差 {lap:.0f}），小幅补清晰度与质感"})
+
+    # ── 拉直 ────────────────────────────────────────────────────────────
+    angle = horizon.get("angle_deg", 0.0)
+    crop = {}
+    if abs(angle) > HORIZON_TOL:
+        crop["StraightenAngle"] = round(angle, 2)
+        reasons.append({"param": "StraightenAngle", "value": round(angle, 2),
+                        "why": f"地平线倾斜 {angle:.2f}°，需自动拉直"})
+
+    # ── 主体 vs 背景 ────────────────────────────────────────────────────
+    # ⚠️ 必须要求真的分割出人物：没人时 subject_luma 恒为 0，会误报"背景比主体亮"。
+    delta = seg.get("subject_minus_background")
+    has_person = seg.get("subject_ratio", 0.0) > 0.02 and seg.get("subject_luma", 0.0) > 0
+    if has_person and delta is not None and delta < BG_BRIGHT_DELTA:
+        notes.append(f"背景比主体亮 {abs(delta):.0f} 级：建议局部压暗背景（渐变/蒙版），"
+                     f"不要靠全局压暗牺牲主体")
+        reasons.append({"param": "needs_mask", "value": "background_darken",
+                        "why": f"主体 {seg.get('subject_luma', 0):.0f} vs 背景 {seg.get('background_luma', 0):.0f}"})
+
+    # ── 场景守则（语义对数值的约束，避免"规则正确但审美错误"）───────────
+    # 实测教训：夜景人像（标签 night_sky、均值 15/255、80% 死黑）会让"救死黑"
+    # 规则一路把阴影抬到 +60、黑色 +25，结果把夜色抬成灰雾、还推高溢出。
+    # 夜景的"死黑"是**创作意图**而非缺陷，必须限幅。
+    labels_blob = " ".join(str(l.get("id", "")) for l in digest.get("labels", [])).lower()
+    is_night = any(k in labels_blob for k in ("night", "dark", "candle", "fireworks")) or mean_luma < 25
+    if is_night:
+        capped = []
+        if develop.get("Shadows2012", 0) > 15:
+            capped.append(f"Shadows2012 {develop['Shadows2012']}→15")
+            develop["Shadows2012"] = 15
+        if develop.get("Blacks2012", 0) > 0:
+            capped.append(f"Blacks2012 {develop['Blacks2012']}→0")
+            develop.pop("Blacks2012", None)
+        if develop.get("Exposure2012", 0) > 1.0:
+            capped.append(f"Exposure2012 {develop['Exposure2012']}→1.0")
+            develop["Exposure2012"] = 1.0
+        notes.append("夜景/暗调：保留黑位（规则已限幅" + ("：" + "，".join(capped) if capped else "") + "）；"
+                     "是否提亮应以主体曝光为准，勿整体提亮")
+
+    # ── 保 / 弃 判定 ────────────────────────────────────────────────────
+    cull_reasons, verdict = [], "keep"
+    if is_utility:
+        verdict = "reject"
+        cull_reasons.append("截图/文档类图片（美学 is_utility=%s，文本 %d 行覆盖 %.3f）"
+                            % (aesthetics.get("is_utility"), text.get("line_count", 0), text.get("box_coverage", 0.0)))
+    if lap < BLURRY_LAPLACIAN:
+        verdict = "reject"
+        cull_reasons.append(f"整体模糊（拉普拉斯方差 {lap:.0f} < {BLURRY_LAPLACIAN:.0f}）")
+    for item in faces.get("items", []):
+        fs = item.get("face_sharpness")
+        if fs is not None and fs < FACE_SHARP_FLOOR:
+            cull_reasons.append(f"主体人脸不实（人脸区域锐度 {fs:.0f} < {FACE_SHARP_FLOOR:.0f}）")
+            verdict = "reject" if verdict != "reject" else verdict
+        if item.get("eyes_open") is False:
+            cull_reasons.append("疑似闭眼（眼睛纵横比过低）")
+    score = aesthetics.get("overall_score")
+    if isinstance(score, (int, float)) and 0 < score < 0.12 and verdict == "keep":
+        verdict = "review"
+        cull_reasons.append(f"美学评分偏低（{score:.3f}），建议人工复核")
+
+    skip_tuning = False
+    if is_utility:
+        # 截图/文档不是"照片"：调参无意义（自动色调会把截图改坏），标记跳过并只保留保/弃结论
+        skip_tuning = True
+        notes.append("非摄影图片（截图/文档）：跳过基础修图流程，仅作排除判定")
+
+    return {"develop": {} if skip_tuning else develop, "crop": crop, "skip_tuning": skip_tuning,
+            "cull": {"verdict": verdict, "reasons": cull_reasons},
+            "reasons": reasons, "notes": notes,
+            "digest_summary": {
+                "mean_luma": round(mean_luma, 1), "clipped_high_pct": round(clip_hi, 2),
+                "clipped_low_pct": round(clip_lo, 2), "contrast_std": round(contrast, 1),
+                "sharpness": round(lap, 1), "is_utility": is_utility,
+                "faces": faces.get("count", 0), "subject_coverage": round(subject.get("coverage", 0.0), 3),
+            }}
+
+
+def llm_layer(digest, draft, endpoint="http://127.0.0.1:8320/v1/chat/completions",
+              model="proteus-1"):
+    """L2：让本地 LLM 读摘要给语义判断（不接管数值）。不可用时静默降级。"""
+    import urllib.request
+    prompt = (
+        "你是摄影后期助手。下面是**由本机视觉算法提取的图像摘要**（你没有直接看图，"
+        "但摘要足以判断内容与质量问题）以及规则给出的调参草稿。\n"
+        f"摘要: {json.dumps(digest, ensure_ascii=False)[:3000]}\n"
+        f"规则草稿: {json.dumps(draft['develop'], ensure_ascii=False)}\n"
+        "请只输出 JSON: {\"subject\":\"画面主体一句话\",\"style_intent\":\"风格意图一句话\","
+        "\"keep\": true/false,\"extra_notes\":\"需要人工注意的点\",\"param_tweaks\":{}}"
+    )
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}],
+                       "max_tokens": 400, "temperature": 0.2}).encode()
+    req = urllib.request.Request(endpoint, data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode())
+        text = data["choices"][0]["message"]["content"]
+        start, end = text.find("{"), text.rfind("}")
+        return json.loads(text[start:end + 1]) if start >= 0 else {"raw": text}
+    except Exception as exc:                                  # 网关未起/模型不支持都不致命
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("digest", help="al-vision 的 JSON（或 - 从 stdin 读）")
+    ap.add_argument("--llm", action="store_true", help="追加 LLM 语义层")
+    ap.add_argument("--endpoint", default="http://127.0.0.1:8320/v1/chat/completions")
+    ap.add_argument("--model", default="proteus-1")
+    args = ap.parse_args()
+
+    raw = sys.stdin.read() if args.digest == "-" else open(args.digest, encoding="utf-8").read()
+    digest = json.loads(raw)
+    result = decide(digest)
+    if args.llm:
+        result["llm"] = llm_layer(digest, result, args.endpoint, args.model)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

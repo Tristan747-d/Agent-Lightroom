@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""al-refresh —— 从**当前实际照片**重新测量并修图（不依赖任何历史配方/记忆）。
+
+与 al-batch 的区别：
+  * al-batch 是上一轮针对特定素材的批处理器；
+  * 本工具**每一步都现场测量**：al-see 取图 → al-vision 测量 → al-tune 规则出参
+    → 写回 → **catalog 回读自证**。没有任何写死的"配方数字"。
+
+单位换算（实测坑，必须做）：
+  al-tune 的 TemperatureDelta 是**开尔文增量 ±400**，而 LR 的 IncrementalTemperature
+  是 0–100 无单位比例。直接透传会发出 -177/400 这种越界值被 LR 钳到边界。
+  按 ±400K ↔ ±100 线性折算（÷4）。
+  Tint 则**本来就是 LR 单位**（±15 量级），不要再折算。
+
+只认回读：写完直接查 catalog 的 Adobe_imageDevelopSettings，值真落库才算成功。
+
+用法:
+    al-refresh --limit 5            # 先试 5 张
+    al-refresh --names "a.jpg,b.jpg"
+    al-refresh                      # 全部（断点续跑）
+"""
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PHOTO_DIR = os.path.expanduser("~/Pictures/Agent Lightroom Test")
+CATALOG = os.path.expanduser("~/Pictures/Lightroom/AgentTest/AgentTest.lrcat")
+PROGRESS = "/tmp/al-refresh-progress.jsonl"
+
+ANALYZE = os.path.join(HERE, "al-analyze")
+AL_CMD = os.path.join(HERE, "al-cmd")
+
+# 规则层白名单（基础影调/色彩），不碰裁切与局部蒙版
+PLAIN_MAP = {
+    "Exposure2012": "exposure", "Contrast2012": "contrast",
+    "Highlights2012": "highlights", "Shadows2012": "shadows",
+    "Whites2012": "whites", "Blacks2012": "blacks",
+    "Vibrance": "vibrance", "Saturation": "saturation",
+    "Clarity2012": "clarity", "Texture": "texture", "Dehaze": "dehaze",
+}
+KELVIN_TO_LR = 4.0          # ±400K ↔ ±100（LR 比例）
+LR_KEYS = {v: k for k, v in PLAIN_MAP.items()}
+
+
+def analyze(name):
+    """跑规则链：al-see → al-vision → al-tune，返回 decision。"""
+    try:
+        p = subprocess.run([ANALYZE, name, "--json"], capture_output=True,
+                           text=True, timeout=180)
+        if p.returncode != 0 or not p.stdout.strip():
+            return None
+        return json.loads(p.stdout).get("decision")
+    except Exception:
+        return None
+
+
+def read_develop(name):
+    """只读 catalog，返回当前非零的数值 develop 键。"""
+    try:
+        con = sqlite3.connect(f"file:{CATALOG}?mode=ro", uri=True, timeout=15)
+        row = con.execute(
+            "select d.text from Adobe_imageDevelopSettings d "
+            "join Adobe_images i on i.id_local=d.image "
+            "join AgLibraryFile f on f.id_local=i.rootFile "
+            "where f.idx_filename=?", (name,)).fetchone()
+        con.close()
+    except Exception:
+        return {}
+    if not row or not row[0]:
+        return {}
+    out = {}
+    for line in row[0].splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            # 末尾项形如 "Whites2012 = -15 }" —— 必须剥掉 ,} 否则解析失败造成假失败
+            k, v = k.strip(), v.strip().rstrip(",}").strip()
+            try:
+                fv = float(v)
+            except ValueError:
+                continue
+            if abs(fv) > 1e-9:
+                out[k] = fv
+    return out
+
+
+def send_develop(name, params, attempts=8):
+    """发命令；只接受新版回报（含 N/M 自证），旧循环的应答一律重发。"""
+    payload = {"type": "develop", "name": name}
+    payload.update(params)
+    for i in range(attempts):
+        try:
+            p = subprocess.run([AL_CMD, json.dumps(payload), "--expect", "ok,error",
+                                "--timeout", "8", "--attempts", "1", "--quiet"],
+                               capture_output=True, text=True, timeout=60)
+            line = (p.stdout or "").strip().splitlines()
+            if not line:
+                continue
+            obj = json.loads(line[-1])
+            if obj.get("status") != "ok":
+                return False, obj.get("message", "error")
+            if "/" in obj.get("message", ""):
+                return True, obj["message"]
+        except Exception:
+            pass
+    return False, "no verified reply"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--names", default="")
+    ap.add_argument("--dry", action="store_true")
+    args = ap.parse_args()
+
+    if args.names:
+        names = [n.strip() for n in args.names.split(",") if n.strip()]
+    else:
+        names = sorted(f for f in os.listdir(PHOTO_DIR)
+                       if f.lower().endswith((".jpg", ".jpeg", ".png", ".heic")))
+
+    done = set()
+    if os.path.exists(PROGRESS):
+        for line in open(PROGRESS):
+            try:
+                r = json.loads(line)
+                if r.get("status") in ("edited", "skipped"):
+                    done.add(r["name"])
+            except Exception:
+                pass
+
+    todo = [n for n in names if n not in done]
+    if args.limit:
+        todo = todo[:args.limit]
+    print(f"待处理 {len(todo)} / 共 {len(names)}（已完成 {len(done)}）", flush=True)
+
+    stats = {"edited": 0, "skipped": 0, "failed": 0, "noop": 0}
+    t0 = time.time()
+    with open(PROGRESS, "a") as fh:
+        for i, name in enumerate(todo, 1):
+            dec = analyze(name)
+            rec = {"name": name, "ts": int(time.time())}
+            if dec is None:
+                rec["status"] = "failed"; rec["why"] = "analyze failed"
+                stats["failed"] += 1
+            else:
+                develop = dec.get("develop") or {}
+                crop = dec.get("crop") or {}
+                if dec.get("skip_tuning"):
+                    rec["status"] = "skipped"
+                    rec["why"] = "non-photographic"
+                    stats["skipped"] += 1
+                else:
+                    params, checks = {}, []
+                    for k, v in develop.items():
+                        if k in PLAIN_MAP:
+                            params[PLAIN_MAP[k]] = v
+                            checks.append((k, float(v)))
+                        elif k == "TemperatureDelta":
+                            # 开尔文 → LR 0-100 比例，并钳到合法区间
+                            lr = max(-100.0, min(100.0, float(v) / KELVIN_TO_LR))
+                            params["temperature"] = round(lr)
+                            checks.append(("IncrementalTemperature", float(round(lr))))
+                        elif k in ("Tint", "TintDelta"):
+                            params["tint"] = round(float(v))
+                            checks.append(("IncrementalTint", float(round(v))))
+                    # 地平线明显倾斜才拉直（>0.5°，与 al-tune 容忍一致）
+                    ang = crop.get("StraightenAngle")
+                    if ang is not None and abs(ang) > 0.5:
+                        params["straighten"] = round(ang, 2)
+                    rec["params"] = params
+                    if not params:
+                        rec["status"] = "noop"; rec["why"] = "no adjustment needed"
+                        stats["noop"] += 1
+                    elif args.dry:
+                        rec["status"] = "edited"; rec["why"] = "DRY"
+                        stats["edited"] += 1
+                    else:
+                        ok, msg = send_develop(name, params)
+                        time.sleep(0.35)
+                        after = read_develop(name)
+                        hit = total = 0
+                        miss = []
+                        for lr_key, want in checks:
+                            if abs(want) < 1e-9:
+                                continue
+                            total += 1
+                            got = after.get(lr_key)
+                            if got is not None and abs(got - want) < 1.01:
+                                hit += 1
+                            else:
+                                miss.append(f"{lr_key}:w{want:g}/g{got}")
+                        if total == 0:
+                            rec["status"] = "noop"; stats["noop"] += 1
+                        elif hit == total:
+                            rec["status"] = "edited"; rec["verified"] = f"{hit}/{total}"
+                            rec["msg"] = msg; stats["edited"] += 1
+                        else:
+                            rec["status"] = "failed"
+                            rec["why"] = f"readback {hit}/{total} " + ";".join(miss[:3])
+                            rec["msg"] = msg; stats["failed"] += 1
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n"); fh.flush()
+            el = time.time() - t0
+            print(f"[{i}/{len(todo)}] {name}: {rec['status']} "
+                  f"{json.dumps(rec.get('params',{}),ensure_ascii=False)}"
+                  f" {rec.get('why','')} ({el:.0f}s)", flush=True)
+
+    stats["elapsed_sec"] = round(time.time() - t0, 1)
+    print("\n=== 汇总 ===", json.dumps(stats, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""al-baseline-vision —— 测量**原片**（不是 LR 预览缓存）以保证判定基准正确。
+
+为什么必须单独做这一层（实锤的设计缺陷）：
+  tools/al-see 读的是 LR **预览缓存**，而预览缓存**已经包含当前 develop 设定**。
+  对一个已经修过的照片再跑 al-see，测到的是"我上一轮改完的结果"，
+  规则于是认为"高光没问题/死黑已解决"→ **89% 的照片 Highlights2012 从未被设置**。
+  这是测量源错误造成的**反馈回路**，不是阈值调参能解决的。
+
+本工具直接对**原片文件**做 al-vision 测量，得到"未修之前真实起点"，
+规则据此出参才是对的。写回后仍可再用预览缓存做"修完长什么样"的复查。
+
+用法:
+    al-baseline-vision "photo.jpg"            # 输出度量 JSON
+    al-baseline-vision "photo.jpg" --dir /path/to/originals
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PHOTO_DIR = os.path.expanduser("~/Pictures/Agent Lightroom Test")
+AL_VISION = os.path.join(HERE, "al-vision")
+
+EXT_OK = (".jpg", ".jpeg", ".png", ".heic", ".tif", ".tiff", ".dng", ".cr2", ".arw", ".nef")
+
+
+def original_path(name, folder=None):
+    """定位原片文件。找不到返回 None。"""
+    folder = folder or PHOTO_DIR
+    p = os.path.join(folder, name)
+    if os.path.isfile(p):
+        return p
+    # 容错：大小写/扩展名差异
+    base = os.path.splitext(name)[0].lower()
+    try:
+        for f in os.listdir(folder):
+            if os.path.splitext(f)[0].lower() == base:
+                return os.path.join(folder, f)
+    except OSError:
+        pass
+    return None
+
+
+def measure(path):
+    """对任意图片路径跑 al-vision，返回度量 dict。"""
+    try:
+        p = subprocess.run([AL_VISION, path], capture_output=True, text=True, timeout=180)
+        if p.returncode != 0 or not p.stdout.strip():
+            return None
+        return json.loads(p.stdout)
+    except Exception:
+        return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("name")
+    ap.add_argument("--dir", default=PHOTO_DIR)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    path = original_path(args.name, args.dir)
+    if not path:
+        print(json.dumps({"error": f"original not found: {args.name}"}, ensure_ascii=False))
+        return 1
+    d = measure(path)
+    if not d:
+        print(json.dumps({"error": "al-vision failed"}, ensure_ascii=False))
+        return 1
+    d["_source"] = path
+    d["_baseline"] = "original-file"      # 明确标出：这是原片，不是预览缓存
+    if args.json:
+        print(json.dumps(d, ensure_ascii=False))
+    else:
+        t = d.get("tone", {})
+        print(f"原片 {os.path.basename(path)}")
+        print(f"  来源 {path}")
+        print(f"  均值 {t.get('mean_luma',0):.0f}  溢出 {t.get('clip_high_pct',0):.2f}%  "
+              f"死黑 {t.get('clip_low_pct',0):.2f}%")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

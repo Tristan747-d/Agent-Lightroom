@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""al-optics-batch —— 批量为本次重修的照片开启光学矫正（镜头矫正+去色差+自动透视）。
+
+只认 catalog 回读：写完直接查 Adobe_imageDevelopSettings，三个键真的为 1 才算成功。
+用法:
+    al-optics-batch --limit 5
+    al-optics-batch                 # 全部（断点续跑）
+"""
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CATALOG = os.path.expanduser("~/Pictures/Lightroom/AgentTest/AgentTest.lrcat")
+SOURCE = "/tmp/al-refresh-progress.jsonl"      # 本次重修成功的名单
+PROGRESS = "/tmp/al-optics-progress.jsonl"
+AL_CMD = os.path.join(HERE, "al-cmd")
+
+WANT = ("LensProfileEnable", "AutoLateralCA", "PerspectiveUpright")
+
+
+def read_keys(name):
+    """只读 catalog，返回 develop 数值键。
+    注意：settings 是 Lua 表，**末尾项**形如 "X = 1 }"，必须剥掉 ,} 否则解析失败。"""
+    con = sqlite3.connect(f"file:{CATALOG}?mode=ro", uri=True, timeout=15)
+    try:
+        r = con.execute(
+            "select d.text from Adobe_imageDevelopSettings d "
+            "join Adobe_images i on i.id_local=d.image "
+            "join AgLibraryFile f on f.id_local=i.rootFile "
+            "where f.idx_filename=?", (name,)).fetchone()
+    finally:
+        con.close()
+    if not r or not r[0]:
+        return {}
+    out = {}
+    for line in r[0].splitlines():
+        if "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        v = v.strip().rstrip(",}").strip()
+        try:
+            out[k] = float(v)
+        except ValueError:
+            continue
+    return out
+
+
+def send(name, attempts=6):
+    for _ in range(attempts):
+        try:
+            p = subprocess.run([AL_CMD, json.dumps({"type": "optics", "name": name}),
+                                "--expect", "ok,error", "--timeout", "10",
+                                "--attempts", "1", "--quiet"],
+                               capture_output=True, text=True, timeout=60)
+            line = (p.stdout or "").strip().splitlines()
+            if not line:
+                continue
+            obj = json.loads(line[-1])
+            if obj.get("status") == "ok" and "LensProfileEnable" in obj.get("message", ""):
+                return True, obj["message"]
+        except Exception:
+            pass
+    return False, "no verified reply"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=0)
+    args = ap.parse_args()
+
+    names = []
+    for line in open(SOURCE):
+        try:
+            r = json.loads(line)
+            if r.get("status") == "edited":
+                names.append(r["name"])
+        except Exception:
+            pass
+    done = set()
+    if os.path.exists(PROGRESS):
+        for line in open(PROGRESS):
+            try:
+                r = json.loads(line)
+                if r.get("status") == "ok":
+                    done.add(r["name"])
+            except Exception:
+                pass
+    todo = [n for n in names if n not in done]
+    if args.limit:
+        todo = todo[:args.limit]
+    print(f"待开光学矫正 {len(todo)} / 共 {len(names)}（已完成 {len(done)}）", flush=True)
+
+    ok = fail = 0
+    t0 = time.time()
+    with open(PROGRESS, "a") as fh:
+        for i, n in enumerate(todo, 1):
+            good, msg = send(n)
+            time.sleep(0.3)
+            cur = read_keys(n)
+            hit = sum(1 for k in WANT if abs(cur.get(k, 0) - 1) < 0.01)
+            rec = {"name": n, "status": "ok" if hit == 3 else "failed",
+                   "hit": f"{hit}/3", "msg": msg}
+            if hit == 3:
+                ok += 1
+            else:
+                fail += 1
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n"); fh.flush()
+            print(f"[{i}/{len(todo)}] {n}: {rec['status']} {rec['hit']} "
+                  f"({time.time()-t0:.0f}s)", flush=True)
+    print(f"\n=== 汇总 === ok={ok} failed={fail} 用时 {time.time()-t0:.0f}s")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""al-batch —— 对目录里全部照片跑「分析 → 写回 Lightroom → 回读验证」的批处理闭环。
+
+设计要点（每一条都对应本项目踩过的坑）：
+
+  1. **只认回读，不认回报**。插件曾出现「报 ok 实际没写」的假成功（写旧键
+     `Exposure` 而 LR 15.5 要 `Exposure2012`）。因此这里写完后**直接查 lrcat
+     的 Adobe_imageDevelopSettings**，值真的变了才算成功。
+  2. **多轮询循环竞争**。LR 里每点一次 Start Bridge 就多一个轮询循环，旧循环会
+     抢走命令并用旧代码应答。判据：插件新版回报格式是
+     `develop done N/M: Key=val …`，不含 `N/M` 的一律当旧循环应答，**重发**。
+  3. **不碰用户的选片标记**。本轮只写 develop，不改 pick/reject/rating。
+  4. **跳过非摄影图片**（截图/文档），避免把时间浪费在截图上——与用户
+     「跳过修图」的既定判定一致。
+  5. **可断点续跑**：progress JSONL 记录已完成项，重跑自动跳过。
+
+用法:
+    al-batch --limit 5                 # 先试 5 张
+    al-batch                           # 全部
+    al-batch --resume                  # 续跑（默认就是续跑）
+    al-batch --dry                     # 只分析不写回
+"""
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PHOTO_DIR = os.path.expanduser("~/Pictures/Agent Lightroom Test")
+CATALOG = os.path.expanduser("~/Pictures/Lightroom/AgentTest/AgentTest.lrcat")
+PROGRESS = "/tmp/al-batch-progress.jsonl"
+REPORT = "/tmp/al-batch-report.json"
+
+ANALYZE = os.path.join(HERE, "al-analyze")
+AL_CMD = os.path.join(HERE, "al-cmd")
+
+# 视觉模型白名单外的键一律不写：只动基础影调/色彩，不碰局部蒙版与几何裁切，
+# 这是「保守自然」风格的边界（用户选定）。
+ALLOWED = {
+    "Exposure2012", "Contrast2012", "Highlights2012", "Shadows2012",
+    "Whites2012", "Blacks2012", "Vibrance", "Saturation",
+    "Clarity2012", "Texture", "Dehaze",
+}
+# al-tune 的增量键 → 插件 develop 命令的参数名。
+# ⚠️ 单位换算（实测踩到的坑）：al-tune 的 TemperatureDelta 是**开尔文增量 ±400**
+# （其源码注释写明「增量，落库时叠加原片色温」），而 LR 的 IncrementalTemperature
+# 是 **0–100 无单位比例**。直接透传会发 -177 / 400 这类越界值，被 LR 钳到边界，
+# 白平衡直接跑飞。按 ±400K ↔ ±100 线性折算。
+KELVIN_TO_LR = 4.0
+
+DELTA_MAP = {
+    "TemperatureDelta": "temperature",   # 发送前经 KELVIN_TO_LR 折算
+    "Tint": "tint",
+    "TintDelta": "tint",
+}
+PLAIN_MAP = {
+    "Exposure2012": "exposure", "Contrast2012": "contrast",
+    "Highlights2012": "highlights", "Shadows2012": "shadows",
+    "Whites2012": "whites", "Blacks2012": "blacks",
+    "Vibrance": "vibrance", "Saturation": "saturation",
+    "Clarity2012": "clarity", "Texture": "texture", "Dehaze": "dehaze",
+}
+
+
+def analyze(name):
+    """跑 al-analyze --json，返回 decision 字典（失败返回 None）。"""
+    try:
+        p = subprocess.run([ANALYZE, name, "--json"], capture_output=True,
+                           text=True, timeout=120)
+        if p.returncode != 0 or not p.stdout.strip():
+            return None
+        return json.loads(p.stdout).get("decision")
+    except Exception:
+        return None
+
+
+def read_develop(name):
+    """直接读 catalog，返回该照片当前的非零 develop 键值（真值来源）。"""
+    try:
+        con = sqlite3.connect(f"file:{CATALOG}?mode=ro", uri=True, timeout=10)
+        row = con.execute(
+            "select d.text from Adobe_imageDevelopSettings d "
+            "join Adobe_images i on i.id_local=d.image "
+            "join AgLibraryFile f on f.id_local=i.rootFile "
+            "where f.idx_filename=?", (name,)).fetchone()
+        con.close()
+    except Exception:
+        return None
+    if not row or not row[0]:
+        return {}
+    out = {}
+    for line in row[0].splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            # ⚠️ 解析坑：settings 文本是 Lua 表，**最后一项**形如 "Whites2012 = -15 }"
+            # ——右花括号粘在值尾部。只 rstrip(",") 会解析失败 → 记为缺失，
+            # 于是「明明写成功却被判失败」（假失败）。统一剥掉逗号/花括号/空白。
+            k, v = k.strip(), v.strip().rstrip(",}").strip()
+            try:
+                fv = float(v)
+            except ValueError:
+                continue
+            if abs(fv) > 1e-9:
+                out[k] = fv
+    return out
+
+
+def dismiss_lr_dialog():
+    """LR 弹出模态对话框（「出现了内部错误」等）时会**阻塞轮询循环**：命令无人处理，
+    或只被上一代旧循环草草应答（不含 N/M 自证）。实测：Bridge.lua 里任一未捕获错误
+    都会弹出该框并**一直挂着**，让整个批处理从此静默劣化——不是超时，而是误判。
+    这里用 System Events 找到 AXDialog 并点「好」，让流程自愈。"""
+    script = (
+        'tell application "System Events" to tell process "Adobe Lightroom Classic"\n'
+        '  set out to ""\n'
+        '  repeat with w in windows\n'
+        '    try\n'
+        '      if (subrole of w) is "AXDialog" then\n'
+        '        repeat with b in (buttons of w)\n'
+        '          if (name of b) is "好" or (name of b) is "OK" then\n'
+        '            click b\n'
+        '            set out to "dismissed"\n'
+        '          end if\n'
+        '        end repeat\n'
+        '      end if\n'
+        '    end try\n'
+        '  end repeat\n'
+        '  return out\n'
+        'end tell')
+    try:
+        p = subprocess.run(["osascript", "-e", script], capture_output=True,
+                           text=True, timeout=15)
+        return "dismissed" in (p.stdout or "")
+    except Exception:
+        return False
+
+
+def send_develop(name, params, attempts=8):
+    """发 develop 命令；只接受**新版**回报（含 N/M 自证）。返回 (ok, msg)。"""
+    payload = {"type": "develop", "name": name}
+    payload.update(params)
+    for i in range(attempts):
+        try:
+            p = subprocess.run([AL_CMD, json.dumps(payload), "--expect", "ok,error",
+                                "--timeout", "8", "--attempts", "1", "--quiet"],
+                               capture_output=True, text=True, timeout=60)
+            line = (p.stdout or "").strip().splitlines()
+            msg = line[-1] if line else ""
+            try:
+                obj = json.loads(msg)
+            except Exception:
+                continue
+            if obj.get("status") != "ok":
+                return False, obj.get("message", "error")
+            # 新版回报形如 "develop done 3/3: Exposure2012=0.5 …"
+            if "/" in obj.get("message", ""):
+                return True, obj["message"]
+            # 旧循环应答 → 重发
+        except Exception:
+            pass
+        # 每 3 次无果就查一次是否有模态框堵着 LR（自愈，避免整轮静默劣化）
+        if i % 3 == 2:
+            dismiss_lr_dialog()
+    return False, "no verified reply (old polling loop kept answering)"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--dry", action="store_true")
+    ap.add_argument("--names", default="", help="只处理这些文件名（逗号分隔）")
+    args = ap.parse_args()
+
+    if args.names:
+        names = [n.strip() for n in args.names.split(",") if n.strip()]
+    else:
+        names = sorted(os.listdir(PHOTO_DIR))
+
+    done = set()
+    if os.path.exists(PROGRESS):
+        with open(PROGRESS) as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                    if r.get("status") in ("edited", "skipped"):
+                        done.add(r["name"])
+                except Exception:
+                    pass
+
+    todo = [n for n in names if n not in done]
+    if args.limit:
+        todo = todo[:args.limit]
+    print(f"待处理 {len(todo)} / 共 {len(names)}（已完成 {len(done)}）", flush=True)
+
+    stats = {"edited": 0, "skipped": 0, "failed": 0, "noop": 0}
+    t0 = time.time()
+    with open(PROGRESS, "a") as fh:
+        for i, name in enumerate(todo, 1):
+            dec = analyze(name)
+            rec = {"name": name, "ts": int(time.time())}
+            if dec is None:
+                rec["status"] = "failed"; rec["why"] = "analyze failed"
+                stats["failed"] += 1
+            else:
+                develop = dec.get("develop") or {}
+                crop = dec.get("crop") or {}
+                rec["cull"] = (dec.get("cull") or {}).get("verdict")
+                rec["reasons"] = dec.get("reasons") or []
+
+                if dec.get("skip_tuning"):
+                    rec["status"] = "skipped"; rec["why"] = "non-photographic (screenshot/doc)"
+                    stats["skipped"] += 1
+                else:
+                    params = {}
+                    for k, v in develop.items():
+                        if k in ALLOWED:
+                            params[PLAIN_MAP[k]] = v
+                        elif k in DELTA_MAP:
+                            val = float(v)
+                            if k == "TemperatureDelta":
+                                # 开尔文增量 → LR 的 0–100 比例，并钳到合法区间
+                                val = max(-100.0, min(100.0, val / KELVIN_TO_LR))
+                            params[DELTA_MAP[k]] = round(val)
+                    # 地平线明显倾斜才拉直（容忍 0.5°，与 al-tune 一致）
+                    ang = crop.get("StraightenAngle")
+                    if ang is not None and abs(ang) > 0.5:
+                        params["straighten"] = round(ang, 2)
+                    rec["params"] = params
+
+                    if not params:
+                        rec["status"] = "noop"; rec["why"] = "no adjustment needed"
+                        stats["noop"] += 1
+                    elif args.dry:
+                        rec["status"] = "edited"; rec["why"] = "DRY RUN"
+                        stats["edited"] += 1
+                    else:
+                        ok, msg = send_develop(name, params)
+                        time.sleep(0.35)          # 等 catalog 落盘
+                        after = read_develop(name) or {}
+                        # 真值判据：写完后**目标 LR 键**确实以期望值出现在 after 里。
+                        # 注意 after 只保留非零值（0=默认值本就不会写进 settings），
+                        # 所以期望为 0 的键视为已满足，不计入分母，否则会把成功误判为失败。
+                        # 比对必须用**已折算成 LR 单位**的期望值：al-tune 给的是开尔文增量，
+                        # 拿开尔文去比对 LR 的 0–100 比例会永远不等（会变成假失败）。
+                        lr_of_delta = {"TemperatureDelta": "IncrementalTemperature",
+                                       "Tint": "IncrementalTint",
+                                       "TintDelta": "IncrementalTint"}
+                        checks = [(k, float(v)) for k, v in develop.items() if k in ALLOWED]
+                        for k in develop:
+                            if k in lr_of_delta and k in DELTA_MAP:
+                                checks.append((lr_of_delta[k], float(params[DELTA_MAP[k]])))
+                        if "straighten" in params:
+                            # StraightenAngle 在未启用裁剪时读回 nil 属正常，
+                            # 不计入分母（否则会把成功误判为失败），只单独回报。
+                            rec["straighten_requested"] = params["straighten"]
+                        hit, total, mismatch = 0, 0, []
+                        for lr_key, want_v in checks:
+                            if abs(want_v) < 1e-9:
+                                continue
+                            total += 1
+                            got = after.get(lr_key)
+                            if got is not None and abs(got - want_v) < 1.01:
+                                hit += 1
+                            else:
+                                mismatch.append(f"{lr_key}:want{want_v:g}/got{got}")
+                        if total == 0:
+                            rec["status"] = "noop"; rec["why"] = "all values already default"
+                            stats["noop"] += 1
+                        elif hit == total:
+                            rec["status"] = "edited"
+                            rec["verified"] = f"{hit}/{total}"
+                            rec["msg"] = msg
+                            stats["edited"] += 1
+                        else:
+                            # 部分写入（如 temp/tint 因 WhiteBalance 未切换而落空）会留下
+                            # **半成品**，比不写更糟：回滚到全 0 再重试一次，重试仍失败才记
+                            # failed，保证「要么整张调好、要么完全没动」。
+                            dismiss_lr_dialog()
+                            send_develop(name, {k: 0 for k in
+                                                ("exposure", "contrast", "highlights", "shadows",
+                                                 "whites", "blacks", "vibrance", "saturation",
+                                                 "clarity", "texture", "dehaze",
+                                                 "temperature", "tint")})
+                            time.sleep(0.3)
+                            ok2, msg2 = send_develop(name, params)
+                            time.sleep(0.35)
+                            after2 = read_develop(name) or {}
+                            hit2 = sum(1 for k, v in checks
+                                       if abs(v) < 1e-9 or
+                                       (after2.get(k) is not None
+                                        and abs(after2[k] - v) < 1.01))
+                            if hit2 == total:
+                                rec["status"] = "edited"
+                                rec["verified"] = f"{hit2}/{total} (retry)"
+                                rec["msg"] = msg2
+                                stats["edited"] += 1
+                            else:
+                                rec["status"] = "failed"
+                                rec["why"] = f"readback {hit}/{total} " + ";".join(mismatch[:3])
+                                rec["msg"] = msg + " || retry: " + (msg2 or "")
+                                stats["failed"] += 1
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n"); fh.flush()
+            el = time.time() - t0
+            print(f"[{i}/{len(todo)}] {name}: {rec['status']}"
+                  f" {rec.get('why','')} {json.dumps(rec.get('params',{}),ensure_ascii=False)}"
+                  f"  ({el:.0f}s)", flush=True)
+
+    stats["elapsed_sec"] = round(time.time() - t0, 1)
+    with open(REPORT, "w") as fh:
+        json.dump(stats, fh, ensure_ascii=False, indent=2)
+    print("\n=== 汇总 ===", json.dumps(stats, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

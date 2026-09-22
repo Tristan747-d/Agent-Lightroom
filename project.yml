@@ -1,0 +1,28 @@
+name: AgentLightroom
+options:
+  bundleIdPrefix: com.agentlightroom
+  deploymentTarget:
+    macOS: "14.0"
+settings:
+  base:
+    PRODUCT_NAME: Agent Lightroom
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+targets:
+  AgentLightroom:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/AgentLightroom
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.agentlightroom.app
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Agent Lightroom
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.photography
+        SWIFT_EMIT_LOC_STRINGS: YES
+      configs:
+        Debug:
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: "-O"

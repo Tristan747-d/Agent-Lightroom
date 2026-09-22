@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Lightroom Workstation Demo</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <!-- ============ LEFT RAIL: pipeline ============ -->
+      <aside class="rail">
+        <div class="brand">
+          <span class="brand-mark">Lr</span>
+          <div>
+            <strong>Agent Lightroom</strong>
+            <span>智能摄影后期工作站</span>
+          </div>
+        </div>
+        <nav class="nav-list" id="pipeline" aria-label="后期流水线"></nav>
+        <div class="agent-mini">
+          <b>人在环</b>：Agent 负责分析 / 执行 / 验证；<b>你</b>负责审片、审美判断与最终确认。
+        </div>
+      </aside>
+
+      <!-- ============ CENTER: workspace ============ -->
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <span class="eyebrow">当前项目</span>
+            <h1 id="page-title">导入拍摄素材</h1>
+          </div>
+          <div style="display:flex;align-items:center;gap:18px">
+            <div class="status-pill" id="statusPill"><span class="dot"></span><span id="statusText">待命 · 等待导入存储卡</span></div>
+            <button class="primary-action" id="runAll">▶ 运行全流程</button>
+          </div>
+        </header>
+
+        <!-- page: import + exif -->
+        <section class="page active" id="page-import">
+          <div id="importView"></div>
+          <div id="exifView" style="display:none"></div>
+        </section>
+
+        <!-- page: cull + similar -->
+        <section class="page" id="page-cull">
+          <div id="cullView"></div>
+          <div id="similarView" style="display:none"></div>
+        </section>
+
+        <!-- page: grade + mask -->
+        <section class="page" id="page-work">
+          <div id="workView"></div>
+          <div id="maskView" style="display:none"></div>
+        </section>
+
+        <!-- page: export -->
+        <section class="page" id="page-export">
+          <div id="exportView"></div>
+        </section>
+
+        <footer class="filmstrip scrollbar" id="filmstrip" aria-label="当前照片列表"></footer>
+      </section>
+
+      <!-- ============ RIGHT: agent console ============ -->
+      <aside class="agent-panel">
+        <div class="agent-head">
+          <div class="av"></div>
+          <div>
+            <div class="nm">后期 Agent</div>
+            <div class="ro">Lightroom Classic 副驾 · 分析 / 执行 / 验证</div>
+          </div>
+        </div>
+        <div class="log scrollbar" id="log"></div>
+        <div class="prompt">
+          <div class="row">
+            <textarea id="nlInput" placeholder="用自然语言描述调色思路，例如：保留现场氛围、人物亮一点、背景压暗…"></textarea>
+            <button class="primary-action" id="gradeBtn">调色</button>
+          </div>
+          <div class="hint">
+            示例：<code>保留现场氛围，人物亮一点，背景压暗，稍微暖一点</code> ·
+            <code>清新自然，提亮阴影，去点灰</code> ·
+            <code>复古胶片感，压高光</code>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <div class="toast" id="toast"></div>
+    <script src="app.js"></script>
+  </body>
+</html>

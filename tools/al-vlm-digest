@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""al-vlm-digest —— 把 al-vlm-scan 的逐张结果聚合成「方法论证据」。
+
+只读 /tmp/al-vlm-scan.jsonl，输出可统计的分布，用来验证（或推翻）方法论假设。
+
+用法:
+    tools/al-vlm-digest            # 全量聚合
+    tools/al-vlm-digest --by 肤色  # 只看某个维度的分布
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+
+SCAN = "/tmp/al-vlm-scan.jsonl"
+DIMS = ("曝光", "高光", "阴影", "对比", "肤色", "影调取向", "几何", "后期痕迹")
+
+
+def load():
+    rows = []
+    if not os.path.exists(SCAN):
+        return rows
+    for line in open(SCAN):
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("vlm"):
+            rows.append(r)
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--by", default="")
+    args = ap.parse_args()
+    rows = load()
+    if not rows:
+        print("没有可用数据（先跑 tools/al-vlm-scan）")
+        return 1
+    print(f"VLM 已读 {len(rows)} 张\n")
+
+    if args.by:
+        c = Counter(r["vlm"].get(args.by, "?") for r in rows)
+        print(f"=== 维度「{args.by}」分布 ===")
+        for k, v in c.most_common():
+            print(f"  {k:12s} {v:4d}  ({v*100//len(rows)}%)")
+        return 0
+
+    print("=== 各维度分布 ===")
+    for d in DIMS:
+        c = Counter(r["vlm"].get(d, "?") for r in rows)
+        tot = sum(c.values())
+        top = "  ".join(f"{k}:{v*100//tot}%" for k, v in c.most_common(5))
+        print(f"  {d:8s}  {top}")
+
+    # 影调取向 × 曝光 交叉表：验证「保高光」是否与曝光策略绑定
+    print("\n=== 交叉：影调取向 × 曝光观感 ===")
+    cross = defaultdict(Counter)
+    for r in rows:
+        cross[r["vlm"].get("影调取向", "?")][r["vlm"].get("曝光", "?")] += 1
+    for tone, c in sorted(cross.items(), key=lambda x: -sum(x[1].values())):
+        print(f"  {tone:8s} {dict(c)}")
+
+    # 缺陷统计
+    print("\n=== 缺陷检出（你保留了哪些）===")
+    dc = Counter()
+    for r in rows:
+        for part in re.split(r"[,，]", r["vlm"].get("缺陷", "")):
+            part = part.strip()
+            if part:
+                dc[part] += 1
+    for k, v in dc.most_common():
+        print(f"  {k:8s} {v:4d}")
+
+    # develop 数值与 VLM 观感的一致性检查
+    print("\n=== 一致性检查：VLM 说『保住高光』的照片，Highlights2012 是否真在压 ===")
+    pos = [r for r in rows if r["vlm"].get("高光") == "保住"]
+    if pos:
+        hs = [r["develop"].get("Highlights2012", 0) for r in pos]
+        neg = len([x for x in hs if x < 0])
+        print(f"  说『保住』{len(pos)} 张，其中 Highlights2012<0（确实在压）: {neg} "
+              f"({neg*100//len(pos)}%)")
+        ex = [r["develop"].get("Exposure2012", 0) for r in pos]
+        posx = len([x for x in ex if x > 0])
+        print(f"  其中 Exposure2012>0（同时提亮）: {posx} ({posx*100//len(pos)}%)"
+              f"  ← ETTR 证据")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

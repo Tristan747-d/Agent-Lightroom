@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""al-style-diff —— 对照「Agent 手修前基线」与「用户手修后现状」，量化用户风格。
+
+用途：用户手修一遍后，用这个把差异变成可执行的规则，而不是靠印象。
+
+    tools/al-style-diff                      # 打印差异报告
+    tools/al-style-diff --json out.json      # 另存机器可读结果
+
+设计要点：
+  * 基线来自 /tmp/al-agent-baseline.json（Agent 写完后冻结的快照）。
+  * 现状直接读 catalog，因此**只读用户结果，绝不修改**。
+  * 分四类统计：改大 / 改小 / 清零 / 用户新增（Agent 原本没动的键）。
+  * 额外识别「Agent 从不使用、用户却用了」的键（HSL、蒙版、曲线等），
+    这类差异说明 Agent 的白名单表达力不足，是最有价值的信号。
+"""
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+from collections import Counter, defaultdict
+
+CATALOG = os.path.expanduser("~/Pictures/Lightroom/AgentTest/AgentTest.lrcat")
+BASELINE = "/tmp/al-agent-baseline.json"
+
+# Agent 这一轮用到的键（白名单），用于判「用户新增」
+AGENT_KEYS = {
+    "Exposure2012", "Contrast2012", "Highlights2012", "Shadows2012",
+    "Whites2012", "Blacks2012", "Vibrance", "Saturation",
+    "Clarity2012", "Texture", "Dehaze", "IncrementalTint",
+    "IncrementalTemperature", "StraightenAngle",
+}
+
+# 数值型 develop 键（正则取；字符串键如 WhiteBalance 单列）
+NUM_KEYS = (
+    "Exposure2012", "Contrast2012", "Highlights2012", "Shadows2012",
+    "Whites2012", "Blacks2012", "Vibrance", "Saturation", "Clarity2012",
+    "Texture", "Dehaze", "IncrementalTint", "IncrementalTemperature",
+    "StraightenAngle", "Temperature", "Tint",
+    # 用户可能用、Agent 从不用的高级键（表达力盲区）
+    "ColorGradeGlobalHue", "ColorGradeGlobalSat", "ColorGradeGlobalLum",
+    "ColorGradeShadowHue", "ColorGradeShadowSat", "ColorGradeHighlightHue",
+    "ColorGradeHighlightSat", "ColorGradeMidtoneHue", "ColorGradeMidtoneSat",
+    "ParametricShadows", "ParametricDarks", "ParametricLights",
+    "ParametricHighlights", "SharpenAmount", "LuminanceSmoothing",
+    "PostCropVignetteAmount", "GrainAmount", "SplitToningShadowHue",
+    "SplitToningHighlightHue", "HueAdjustmentRed", "HueAdjustmentOrange",
+    "SaturationAdjustmentRed", "SaturationAdjustmentOrange",
+    "LuminanceAdjustmentRed", "LuminanceAdjustmentOrange",
+)
+
+
+def read_settings(name):
+    """读一张照片的 develop 数值键（只读，绝不写）。"""
+    con = sqlite3.connect(f"file:{CATALOG}?mode=ro", uri=True, timeout=10)
+    try:
+        row = con.execute(
+            "select d.text from Adobe_imageDevelopSettings d "
+            "join Adobe_images i on i.id_local=d.image "
+            "join AgLibraryFile f on f.id_local=i.rootFile "
+            "where f.idx_filename=?", (name,)).fetchone()
+    finally:
+        con.close()
+    txt = row[0] if row else ""
+    out = {}
+    for k, v in re.findall(r"(" + "|".join(NUM_KEYS) + r") = (-?[0-9.]+)", txt):
+        fv = float(v)
+        if abs(fv) > 1e-9:
+            out[k] = fv
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", default="")
+    args = ap.parse_args()
+
+    if not os.path.exists(BASELINE):
+        print(f"✗ 找不到基线 {BASELINE}（Agent 手修前快照）")
+        return 1
+    base = json.load(open(BASELINE))
+    print(f"基线照片 {len(base)} 张\n")
+
+    changed = defaultdict(list)   # key -> [(name, base, now)]
+    zeroed = defaultdict(list)    # 用户清零
+    added_new = defaultdict(list) # 用户启用了 Agent 没动的键
+    untouched = []
+    per_photo_delta = {}
+
+    for name, b in sorted(base.items()):
+        now = read_settings(name)
+        # 基线是字符串、现状是 float，直接 `now == b` 恒为 False，
+        # 会把「用户压根没动」误报成「改动了」（自检踩到）。统一转 float 再比。
+        def _num(d):
+            out = {}
+            for k, v in d.items():
+                try:
+                    out[k] = float(v)
+                except (TypeError, ValueError):
+                    pass
+            return out
+        b, now = _num(b), _num(now)
+        if now == b:
+            untouched.append(name)
+            continue
+        delta = {}
+        keys = set(b) | set(now)
+        for k in keys:
+            # 基线 JSON 的值是字符串（正则抓取结果），必须显式转 float，
+            # 否则 abs(bv - nv) 会抛 "str - float"（自检时实际踩到）。
+            try:
+                bv = float(b.get(k, 0.0))
+                nv = float(now.get(k, 0.0))
+            except (TypeError, ValueError):
+                continue
+            if abs(bv - nv) < 1e-9:
+                continue
+            delta[k] = {"base": bv, "now": nv, "diff": round(nv - bv, 2)}
+            if abs(nv) < 1e-9:
+                zeroed[k].append((name, bv))
+            elif k not in b:
+                added_new[k].append((name, nv))
+            else:
+                changed[k].append((name, bv, nv))
+        if delta:
+            per_photo_delta[name] = delta
+
+    print(f"=== 总览 ===")
+    print(f"用户改动的照片: {len(per_photo_delta)} / {len(base)}")
+    print(f"用户完全没动  : {len(untouched)}  (= Agent 调得可接受，或用户跳过)")
+
+    print(f"\n=== 1) 用户把 Agent 的值改大/改小（次数最多的键） ===")
+    for k, items in sorted(changed.items(), key=lambda x: -len(x[1]))[:15]:
+        diffs = [n - b for _, b, n in items]
+        avg = sum(diffs) / len(diffs)
+        print(f"  {k:24s} {len(items):3d} 次  Agent中位偏差 {avg:+.1f}"
+              f"  (用户值 − Agent值)")
+        for nm, bv, nv in items[:3]:
+            print(f"      {nm}: {bv:g} → {nv:g}")
+
+    print(f"\n=== 2) 用户把 Agent 的调整清零（= Agent 多此一举） ===")
+    for k, items in sorted(zeroed.items(), key=lambda x: -len(x[1]))[:15]:
+        print(f"  {k:24s} {len(items):3d} 次被清零  (Agent 原值示例 "
+              f"{', '.join(f'{v:g}' for _, v in items[:4])})")
+
+    print(f"\n=== 3) 用户启用了 Agent 没动过的键（表达力盲区，最有价值） ===")
+    if not added_new:
+        print("  （无 —— 说明用户也只用基础键，Agent 白名单够用）")
+    for k, items in sorted(added_new.items(), key=lambda x: -len(x[1]))[:20]:
+        vals = [v for _, v in items]
+        tag = "★ Agent 白名单外" if k not in AGENT_KEYS else "白名单内但漏判"
+        print(f"  {k:24s} {len(items):3d} 次  {tag}")
+        print(f"      值域 [{min(vals):g}, {max(vals):g}]  示例 {vals[:5]}")
+
+    print(f"\n=== 4) 改动最剧烈的照片（建议人眼复核） ===")
+    scored = []
+    for nm, d in per_photo_delta.items():
+        score = sum(abs(v["diff"]) for v in d.values())
+        scored.append((score, nm, d))
+    for score, nm, d in sorted(scored, reverse=True)[:10]:
+        brief = ", ".join(f"{k}:{v['base']:g}→{v['now']:g}" for k, v in d.items())
+        print(f"  [{score:6.1f}] {nm}  {brief[:110]}")
+
+    if args.json:
+        json.dump({
+            "changed": {k: v for k, v in changed.items()},
+            "zeroed": {k: v for k, v in zeroed.items()},
+            "added_new": {k: v for k, v in added_new.items()},
+            "untouched": untouched,
+            "per_photo_delta": per_photo_delta,
+        }, open(args.json, "w"), ensure_ascii=False, indent=1)
+        print(f"\n已写出 {args.json}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
