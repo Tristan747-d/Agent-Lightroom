@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""al-perfcheck —— 开批前的机器状态自检（防止「同一份代码 6.6× 波动」重演）。
+
+背景（实测）：同一个 MLX matmul 基准，代码一字未改，在 3 小时内
+  01:15 电池 66% → 7.10 TFLOP/s
+  02:56 电池 36% → 1.37 TFLOP/s
+  03:35 电池 ~30% → 0.39 TFLOP/s（1/18）
+且静置 25 分钟**未恢复**。这不是代码问题，是电池/功耗策略导致的持续降频。
+因此**任何修图批处理开跑前必须先跑本自检**，低于阈值就拒绝开批。
+
+用法:
+    tools/al-perfcheck              # 只报告
+    tools/al-perfcheck --gate 5.0   # 低于 5.0 TFLOP/s 时退出码 1（可接进脚本）
+"""
+import argparse, subprocess, sys, time
+
+
+def gate(n=20):
+    import mlx.core as mx
+    mx.random.seed(0)
+    a = mx.random.normal((2048, 2048))
+    b = mx.random.normal((2048, 2048))
+    for _ in range(3):
+        mx.eval(mx.matmul(a, b))
+    t = time.time()
+    for _ in range(n):
+        mx.eval(mx.matmul(a, b))
+    dt = (time.time() - t) / n
+    return 2 * 2048 ** 3 / dt / 1e12
+
+
+def cpu_probe():
+    t = time.time()
+    def fib(x):
+        return x if x < 2 else fib(x - 1) + fib(x - 2)
+    fib(30)
+    return time.time() - t
+
+
+def battery():
+    try:
+        o = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout
+        pct = o.split("%")[0].split()[-1]
+        # ⚠️ 不能用 "charging" in o 判断交流电：'discharging' 里也含 'charging'，
+        # 会把放电误报成 AC（本脚本第一版就踩了这个坑）。
+        src = "AC" if "AC Power" in o else "电池"
+        state = ("充电中" if "; charging" in o else
+                 "放电中" if "discharging" in o else "已接电" if "charged" in o else "?")
+        return f"{pct}% {src} {state}"
+    except Exception:
+        return "?"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gate", type=float, default=0.0,
+                    help="低于该 TFLOP/s 即失败（建议 5.0）")
+    args = ap.parse_args()
+    tf = gate()
+    fib_s = cpu_probe()
+    print(f"GPU matmul 2048² : {tf:.2f} TFLOP/s   （M5 快态参考 ~7；<2 视为严重降频）")
+    print(f"CPU fib(30)      : {fib_s*1000:.0f} ms      （M5 快态参考 ~200-400ms）")
+    print(f"电源             : {battery()}")
+    if tf >= 5.0:
+        print("🟩 状态良好，可以开批")
+    elif tf >= 2.0:
+        print("🟨 已降频（~1/3），吞吐会明显偏慢；建议插电+冷却")
+    else:
+        print("🟥 严重降频（~1/18），此刻跑批毫无意义；先插电并冷却")
+    if args.gate and tf < args.gate:
+        print(f"✗ 低于门限 {args.gate} TFLOP/s，拒绝开批")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

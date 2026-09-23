@@ -1,0 +1,830 @@
+#!/usr/bin/env python3
+"""al-fast —— 四道工序流水线（质量等价，吞吐优化版）。
+
+与 al-test3 的**质量契约完全相同**：
+  ① VLM 看前期状态（原片测量 + VLM 24 字段 + 可选我自己的视觉通道）
+  ② 套配方（optics 先行 → 影调成对 → 白平衡复核 → 场景分支）
+  ③ VLM 复查（渲染 + VLM 21 字段）
+  ④ 微调（仅当 ③ 不达标，单参数、幅度 ≤15，逐个回读自证）
+  废片排除：虚焦/表情两条判据都必须「数值 + VLM 双方一致」。
+
+本版只改**吞吐**，不改判据。改动逐条可消融：
+  A. 单次进程常驻 —— 不再每张照片起 5~7 个 Python/Swift 进程（消融: OLD_SUBPROC=1）；
+  B. VLM 在常驻服务上批量预热 —— 模型只加载一次，消除每张的冷启动与页缓存抖动；
+  C. 两段 VLM 并行 —— 工序① 与「al-see 渲染」可并行（渲染不依赖 VLM，VLM 不依赖渲染）；
+  D. 数值测量与 VLM 并行 —— al-vision 与 VLM 读图互不依赖；
+  E. 令牌压缩 —— 输出改位置式（只输出值），实测输出令牌 315→151（-52%）；
+  F. 逐张回读合并为一次 sqlite 查询，不做多次 subprocess sqlite3；
+  G. 中断续跑 + 每张落盘（与 al-test3 相同的 progress 语义）。
+
+⚠️ 本脚本**不假设** MLX 会快。所有加速项都可以用 --ablate 单独关掉，
+   并打印每阶段实测耗时，便于做 A/B 消融而不是空口宣称。
+"""
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PHOTO_DIR = os.path.expanduser("~/Pictures/Agent Lightroom Test")
+CATALOG = os.path.expanduser("~/Pictures/Lightroom/AgentTest/AgentTest.lrcat")
+PROGRESS = "/tmp/al-fast-progress.jsonl"
+VLM = os.environ.get("AL_VLM", "http://127.0.0.1:8321/describe")
+AL_CMD = os.path.join(HERE, "al-cmd")
+AL_VISION = os.path.join(HERE, "al-vision")
+AL_SEE = os.path.join(HERE, "al-see")
+VIEW = "/tmp/agent-lightroom-view.jpg"
+KELVIN_TO_LR = 4.0
+
+PLAIN_MAP = {"Exposure2012": "exposure", "Contrast2012": "contrast",
+             "Highlights2012": "highlights", "Shadows2012": "shadows",
+             "Whites2012": "whites", "Blacks2012": "blacks",
+             "Vibrance": "vibrance", "Saturation": "saturation",
+             "Clarity2012": "clarity", "Texture": "texture", "Dehaze": "dehaze"}
+LR_KEY = {"exposure": "Exposure2012", "contrast": "Contrast2012", "highlights": "Highlights2012",
+          "shadows": "Shadows2012", "whites": "Whites2012", "blacks": "Blacks2012",
+          "vibrance": "Vibrance", "saturation": "Saturation", "clarity": "Clarity2012",
+          "texture": "Texture", "dehaze": "Dehaze",
+          "temperature": "IncrementalTemperature", "tint": "IncrementalTint"}
+
+# ── VLM 提示：行式（与 al-vlm-check2 同字段同语义）与位置式（只输出值）──
+BEFORE_KEYS = ("主题", "图片类型", "主体", "主体位置", "主体明暗", "构图", "内容", "曝光", "高光", "阴影",
+               "对比", "色彩情况", "白平衡情况", "人物情况", "表情", "肤色", "焦点情况", "噪点可见性", "横平竖直", "几何", "缺陷",
+               "需要去朦胧", "调色方向", "优先动作")
+AFTER_KEYS = ("主题", "图片类型", "主体", "构图", "曝光", "高光", "阴影", "对比", "色彩情况", "白平衡情况",
+              "人物情况", "表情", "肤色", "焦点情况", "噪点可见性", "横平竖直", "几何", "缺陷",
+              "主体突出度", "是否过修", "仍存在的问题")
+
+PROMPT_BEFORE = """你是资深修图师。仔细看这张**修图前**的照片。
+【硬性要求】必须输出下面**全部**字段，一行一个，**一个都不许省略、不许合并、不许跳过**；
+每行格式固定为 `字段名: 内容`，即使不确定也要给出最接近的取值，不要写"无法判断"。
+带缩进说明的行（如 位置/依据/理由）必须跟在对应主字段之后。
+
+主题: <这张照片的主体内容归类，如 人像/合影/风光/活动记录/静物/文档>
+图片类型: <JPEG直出|相机RAW|手机拍摄|截图|扫描件|其他>   画质: <高|中|低>
+主体: <主体是什么（人/物/景），有几个>
+主体位置: <画面上/中/下/左/中/右；占画面比例大/中/小>
+主体明暗: <主体比背景亮|主体比背景暗|差不多>
+构图: <三分法|居中|对称|引导线|框架式|留白多|主体过小|主体被裁切|杂乱>   问题: <无|头顶空间不足|主体太靠边|背景干扰|水平失衡>
+内容: <一句话场景描述>
+曝光: <偏亮|适中|偏暗>
+高光: <有溢出风险|安全>   位置: <哪块区域最亮>
+阴影: <死黑|略沉|通透>   位置: <哪块区域最暗>
+对比: <偏低|适中|偏高>
+色彩情况: <过艳|正常|偏淡|偏灰>   主色调: <暖黄|冷蓝|绿|中性|其他>
+白平衡情况: <准确|偏黄|偏蓝|偏绿|偏品红>   依据: <肤色/白墙/天空等参照物>
+人物情况: <无人物|单人|多人合影|人像特写|人物较小>   人数: <几>
+表情: <无人物|自然放松|微笑|大笑|严肃|闭眼|眨眼|表情尴尬|张嘴说话|被遮挡>   眼神: <看镜头|看别处|无人物>
+肤色: <无人物|自然|偏黄|偏红|偏冷>
+焦点情况: <主体清晰|主体虚焦|整体模糊|局部虚焦>   焦点位置: <在哪>
+横平竖直: <是|否>   倾斜方向: <左倾|右倾|无>   倾斜程度: <轻微|明显>
+几何: <横平竖直|倾斜>   方向: <左倾|右倾|无>
+噪点可见性: <不可见|轻微|明显|严重>   区域: <暗部/天空/整体>
+缺陷: <无|噪点|污点|虚焦|过曝>   位置: <在哪>
+需要去朦胧: <是|否>   理由: <雾霾/逆光灰蒙/不需要>
+调色方向: <保高光|保阴影|均衡>   理由: <一句>
+优先动作: <你作为修图师第一步会动什么，要具体到部位>
+"""
+
+PROMPT_AFTER = """你是资深修图师，正在**验收**一张刚修完的照片。
+【硬性要求】必须输出下面**全部**字段，一行一个，**一个都不许省略、不许合并、不许跳过**；
+每行格式固定为 `字段名: 内容`，即使不确定也要给出最接近的取值，不要写"无法判断"。
+
+主题: <主体内容归类，如 人像/合影/风光/活动记录/静物/文档>
+图片类型: <JPEG直出|相机RAW|手机拍摄|截图|扫描件|其他>
+主体: <主体是什么，是否清晰突出>
+构图: <合理|可改进>   问题: <无|主体过小|主体被裁切|背景干扰|水平失衡>
+曝光: <偏亮|适中|偏暗>
+高光: <保住|轻微溢出|明显溢出>
+阴影: <通透|略沉|死黑>
+对比: <偏低|适中|偏高>
+色彩情况: <过艳|正常|偏淡|偏灰>   主色调: <暖黄|冷蓝|绿|中性|其他>
+白平衡情况: <准确|偏黄|偏蓝|偏绿|偏品红>   依据: <肤色/白墙/天空等参照物>
+人物情况: <无人物|单人|多人合影|人像特写|人物较小>   人数: <几>
+表情: <无人物|自然放松|微笑|大笑|严肃|闭眼|眨眼|表情尴尬|张嘴说话|被遮挡>   眼神: <看镜头|看别处|无人物>
+肤色: <无人物|自然|偏黄|偏红|偏冷>
+焦点情况: <主体清晰|主体虚焦|整体模糊|局部虚焦>   焦点位置: <在哪>
+横平竖直: <是|否>   倾斜方向: <左倾|右倾|无>
+几何: <横平竖直|倾斜>
+噪点可见性: <不可见|轻微|明显|严重>
+缺陷: <无|噪点|污点|虚焦>
+主体突出度: <突出|一般|被背景抢戏>
+是否过修: <否|是>   理由: <一句>
+仍存在的问题: <无|具体问题>
+"""
+
+# 位置式提示：语义与上面完全一致，只是把「字段名: 」的令牌开销砍掉。
+# 实测字段名开销占输出的 ~52%（315→151 令牌），但模型必须严格按序输出。
+# ── 位置式（只输出值）提示：**由字段表程序化生成**，不手写编号 ───────────
+# 手写编号曾与字段表错位（把「构图问题」插在第 7 行而字段表第 7 项是「内容」），
+# 于是值整体下移一位、A 字段的值被写进 B 字段——位置式最危险的失效模式。
+# 现在提示与解析共用同一份 ORDER，错位在构造上不可能发生。
+POS_SPEC_BEFORE = [
+    ("主题", "[人像/合影/风光/活动记录/静物/文档]"),
+    ("图片类型", "[JPEG直出/相机RAW/手机拍摄/截图/扫描件/其他]"),
+    ("主体", "<是什么、几个，12字内>"),
+    ("主体位置", "<上中下 + 左中右 + 大小>"),
+    ("主体明暗", "[主体比背景亮/主体比背景暗/差不多]"),
+    ("构图", "[三分法/居中/对称/引导线/框架式/留白多/主体过小/主体被裁切/杂乱]"),
+    ("内容", "<一句话，20字内>"),
+    ("曝光", "[偏亮/适中/偏暗]"),
+    ("高光", "[有溢出风险/安全]"),
+    ("阴影", "[死黑/略沉/通透]"),
+    ("对比", "[偏低/适中/偏高]"),
+    ("色彩情况", "[过艳/正常/偏淡/偏灰]"),
+    ("白平衡情况", "[准确/偏黄/偏蓝/偏绿/偏品红]"),
+    ("人物情况", "[无人物/单人/多人合影/人像特写/人物较小]"),
+    ("表情", "[无人物/自然放松/微笑/大笑/严肃/闭眼/眨眼/表情尴尬/张嘴说话/被遮挡]"),
+    ("肤色", "[无人物/自然/偏黄/偏红/偏冷]"),
+    ("焦点情况", "[主体清晰/主体虚焦|整体模糊|局部虚焦]"),
+    ("噪点可见性", "[不可见/轻微/明显/严重]"),
+    ("横平竖直", "[是/否]"),
+    ("几何", "[横平竖直/倾斜]"),
+    ("缺陷", "[无/噪点/污点/虚焦/过曝]"),
+    ("需要去朦胧", "[是/否]"),
+    ("调色方向", "[保高光/保阴影/均衡]"),
+    ("优先动作", "<具体到部位，15字内>"),
+    # 以下为逻辑会读、但不属于 24 主字段的补充项，显式列在末尾，避免插进主表造成错位
+    ("构图问题", "[无/头顶空间不足/主体太靠边/背景干扰/水平失衡]"),
+    ("高光位置", "<最亮区域，6字内>"),
+    ("阴影位置", "<最暗区域，6字内>"),
+    ("白平衡依据", "<参照物，6字内>"),
+    ("人数", "<数字或 20+>"),
+    ("眼神", "[看镜头/看别处/无人物]"),
+    ("焦点位置", "<在哪，6字内>"),
+    ("倾斜方向", "[左倾/右倾/无]"),
+    ("倾斜程度", "[轻微/明显/无]"),
+    ("噪点区域", "[暗部/天空/整体]"),
+    ("缺陷位置", "<在哪，6字内>"),
+    ("去朦胧理由", "[雾霾/逆光灰蒙/不需要]"),
+    ("调色理由", "<一句，10字内>"),
+]
+POS_SPEC_AFTER = [
+    ("主题", "[人像/合影/风光/活动记录/静物/文档]"),
+    ("图片类型", "[JPEG直出/相机RAW/手机拍摄/截图/扫描件/其他]"),
+    ("主体", "<是什么、是否清晰突出，12字内>"),
+    ("构图", "[合理/可改进]"),
+    ("曝光", "[偏亮/适中/偏暗]"),
+    ("高光", "[保住/轻微溢出/明显溢出]"),
+    ("阴影", "[通透/略沉/死黑]"),
+    ("对比", "[偏低/适中/偏高]"),
+    ("色彩情况", "[过艳/正常/偏淡/偏灰]"),
+    ("白平衡情况", "[准确/偏黄/偏蓝/偏绿/偏品红]"),
+    ("人物情况", "[无人物/单人/多人合影/人像特写/人物较小]"),
+    ("表情", "[无人物/自然放松/微笑/大笑/严肃/闭眼/眨眼/表情尴尬/张嘴说话/被遮挡]"),
+    ("肤色", "[无人物/自然/偏黄/偏红/偏冷]"),
+    ("焦点情况", "[主体清晰/主体虚焦/整体模糊/局部虚焦]"),
+    ("噪点可见性", "[不可见/轻微/明显/严重]"),
+    ("横平竖直", "[是/否]"),
+    ("几何", "[横平竖直/倾斜]"),
+    ("缺陷", "[无/噪点/污点/虚焦]"),
+    ("主体突出度", "[突出/一般/被背景抢戏]"),
+    ("是否过修", "[否/是]"),
+    ("仍存在的问题", "[无/<具体问题，15字内>]"),
+    ("构图问题", "[无/主体过小/主体被裁切/背景干扰/水平失衡]"),
+    ("焦点位置", "<在哪，6字内>"),
+    ("倾斜方向", "[左倾/右倾/无]"),
+    ("白平衡依据", "<参照物，6字内>"),
+    ("眼神", "[看镜头/看别处/无人物]"),
+    ("人数", "<数字或 20+>"),
+    ("过修理由", "<一句，10字内>"),
+]
+
+
+def build_pos_prompt(spec, title):
+    lines = [f"看这张{title}的照片。严格按下面顺序，每行**只写值**，"
+             f"不要字段名、不要序号、不要解释。",
+             f"必须输出全部 {len(spec)} 行，一行不许少。尖括号是取值要求，不是要你写的字。", ""]
+    for i, (_, hint) in enumerate(spec, 1):
+        lines.append(f"{i} {hint}")
+    return "\n".join(lines) + "\n"
+
+
+PROMPT_BEFORE_POS = build_pos_prompt(POS_SPEC_BEFORE, "**修图前**")
+PROMPT_AFTER_POS = build_pos_prompt(POS_SPEC_AFTER, "**刚修完**")
+POS_ORDER_BEFORE = tuple(k for k, _ in POS_SPEC_BEFORE)
+POS_ORDER_AFTER = tuple(k for k, _ in POS_SPEC_AFTER)
+
+# 自检：位置式顺序的**前 N 项**必须与主字段表严格同序同长，否则位置解析会把值串位。
+assert POS_ORDER_BEFORE[:len(BEFORE_KEYS)] == BEFORE_KEYS, "位置式 before 顺序与字段表错位"
+assert POS_ORDER_AFTER[:len(AFTER_KEYS)] == AFTER_KEYS, "位置式 after 顺序与字段表错位"
+assert len(set(POS_ORDER_BEFORE)) == len(POS_ORDER_BEFORE), "位置式 before 有重复字段"
+assert len(set(POS_ORDER_AFTER)) == len(POS_ORDER_AFTER), "位置式 after 有重复字段"
+
+
+def parse_lossless(text, keys):
+    """无损解析（与 al-vlm-check2 同实现）：主字段进 dict，子字段挂父字段，另存原始行。"""
+    ordered, subs, lines = {}, {}, []
+    last = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lines.append(line)
+        if ":" not in line and "：" not in line:
+            continue
+        k, _, v = line.replace("：", ":").partition(":")
+        k, v = k.strip(), v.strip()
+        if not k:
+            continue
+        if k in keys:
+            ordered[k] = v
+            subs.setdefault(k, [])
+            last = k
+        elif last:
+            subs[last].append((k, v))
+    return ordered, subs, lines
+
+
+# 位置式输出的**取值白名单**：位置式解析没有字段名护栏，一旦模型错行/多话，
+# 就会把 A 字段的值悄悄写到 B 字段上（实测出现过「主体明暗=中上中」这类串位）。
+# 因此对**枚举型字段**做词表校验：值不在白名单内 → 判定该解析不可信 → 调用方回退行式提示。
+ENUM_KEYS = {
+    "主题": ("人像", "合影", "风光", "活动记录", "静物", "文档"),
+    "图片类型": ("JPEG直出", "相机RAW", "手机拍摄", "截图", "扫描件", "其他"),
+    "主体明暗": ("主体比背景亮", "主体比背景暗", "差不多"),
+    "曝光": ("偏亮", "适中", "偏暗"),
+    "对比": ("偏低", "适中", "偏高"),
+    "色彩情况": ("过艳", "正常", "偏淡", "偏灰"),
+    "主色调": ("暖黄", "冷蓝", "绿", "中性", "其他"),
+    "白平衡情况": ("准确", "偏黄", "偏蓝", "偏绿", "偏品红"),
+    "人物情况": ("无人物", "单人", "多人合影", "人像特写", "人物较小"),
+    "肤色": ("无人物", "自然", "偏黄", "偏红", "偏冷"),
+    "焦点情况": ("主体清晰", "主体虚焦", "整体模糊", "局部虚焦"),
+    "横平竖直": ("是", "否"),
+    "几何": ("横平竖直", "倾斜"),
+    "噪点可见性": ("不可见", "轻微", "明显", "严重"),
+    "需要去朦胧": ("是", "否"),
+    "调色方向": ("保高光", "保阴影", "均衡"),
+    "高光": ("有溢出风险", "安全", "保住", "轻微溢出", "明显溢出"),
+    "阴影": ("死黑", "略沉", "通透"),
+    "构图": ("三分法", "居中", "对称", "引导线", "框架式", "留白多",
+             "主体过小", "主体被裁切", "杂乱", "合理", "可改进"),
+    "主体突出度": ("突出", "一般", "被背景抢戏"),
+    "是否过修": ("否", "是"),
+}
+
+
+def positional_trustworthy(fields):
+    """位置式解析的可信度检查。返回 (可信?, 越界字段列表)。"""
+    bad = []
+    for k, allowed in ENUM_KEYS.items():
+        v = fields.get(k)
+        if v is None:
+            continue
+        if not any(a in v for a in allowed):
+            bad.append(f"{k}={v!r}")
+    return (not bad), bad
+
+
+# ── ⚠️ 精简提示（--lean）：**实测会降低语义质量，默认关闭，不要用于生产** ──
+# 动机：当前 before 输出 315 令牌 / 40 行，其中「画质/位置×2/主色调/依据/人数/眼神/
+# 焦点位置/倾斜方向/倾斜程度/方向/区域/位置/理由×2」这些子字段没有任何代码读它们，
+# 却占了 ~112 令牌（36%）；而输出令牌是 4B 解码的唯一大成本（2.5-3.3 tok/s）。
+#
+# **但 2026-09-23 的消融实验否掉了它**（同一张图 IMG_20251226_211917.jpg，VLM 完全确定性，
+# 同提示两次 10/10 一致，所以差异是提示词造成的、不是随机噪声）：
+#   A 原全字段提示（al-vlm-check2 原文）：人像 / 多人合影 / 自然放松   ← 与我亲眼看图一致
+#   B 我的 lean（缩指令+删子字段+改顺序）：活动记录 / 人像特写 / 严肃   ← 主题与表情都判错
+#   C 原指令原文、**只删子字段**        ：人像 / 人像特写 / 严肃 / 需要去朦胧=是 ← 表情判错，且幻觉出 dehaze
+# A 与 B 一致 7/10、与 C 一致 6/10。
+# 结论：那些"没人读"的子字段其实是**思维链脚手架**——去掉它们会让模型偷懒并幻觉
+# （C 甚至把 需要去朦胧 从「否」翻成「是」，会误加 dehaze +15，属真实修图事故）。
+# 因此：**默认必须用全字段提示**；--lean 仅供对照实验，任何生产批次都不得开启。
+# 真正要省令牌，只能靠换模型或减少『必需』字段，不能靠删脚手架。
+PROMPT_BEFORE_LEAN = """你是资深修图师。仔细看这张**修图前**的照片。
+【硬性要求】必须输出下面**全部**字段，一行一个，**一个都不许省略、不许合并、不许跳过**；
+格式固定为 `字段名: 内容`。即使不确定也要给出最接近的取值，不要写"无法判断"。
+自由文本字段请**尽量简短**（内容≤15字，优先动作≤12字）。
+
+主题: <人像|合影|风光|活动记录|静物|文档>
+图片类型: <JPEG直出|相机RAW|手机拍摄|截图|扫描件|其他>
+主体: <主体是什么、几个，10字内>
+主体位置: <上/中/下 + 左/中/右 + 大/中/小>
+主体明暗: <主体比背景亮|主体比背景暗|差不多>
+构图: <三分法|居中|对称|引导线|框架式|留白多|主体过小|主体被裁切|杂乱>
+内容: <一句话，15字内>
+曝光: <偏亮|适中|偏暗>
+高光: <有溢出风险|安全>
+阴影: <死黑|略沉|通透>
+对比: <偏低|适中|偏高>
+色彩情况: <过艳|正常|偏淡|偏灰>
+白平衡情况: <准确|偏黄|偏蓝|偏绿|偏品红>
+人物情况: <无人物|单人|多人合影|人像特写|人物较小>
+表情: <无人物|自然放松|微笑|大笑|严肃|闭眼|眨眼|表情尴尬|张嘴说话|被遮挡>
+肤色: <无人物|自然|偏黄|偏红|偏冷>
+焦点情况: <主体清晰|主体虚焦|整体模糊|局部虚焦>
+横平竖直: <是|否>
+几何: <横平竖直|倾斜>
+噪点可见性: <不可见|轻微|明显|严重>
+缺陷: <无|噪点|污点|虚焦|过曝>
+需要去朦胧: <是|否>
+调色方向: <保高光|保阴影|均衡>
+优先动作: <第一步会动什么，12字内>
+"""
+
+PROMPT_AFTER_LEAN = """你是资深修图师，正在**验收**一张刚修完的照片。
+【硬性要求】必须输出下面**全部**字段，一行一个，**一个都不许省略、不许合并、不许跳过**；
+格式固定为 `字段名: 内容`。自由文本请**尽量简短**（主体≤10字，仍存在的问题≤12字）。
+
+主题: <人像|合影|风光|活动记录|静物|文档>
+图片类型: <JPEG直出|相机RAW|手机拍摄|截图|扫描件|其他>
+主体: <是什么、是否清晰突出，10字内>
+构图: <合理|可改进>
+曝光: <偏亮|适中|偏暗>
+高光: <保住|轻微溢出|明显溢出>
+阴影: <通透|略沉|死黑>
+对比: <偏低|适中|偏高>
+色彩情况: <过艳|正常|偏淡|偏灰>
+白平衡情况: <准确|偏黄|偏蓝|偏绿|偏品红>
+人物情况: <无人物|单人|多人合影|人像特写|人物较小>
+表情: <无人物|自然放松|微笑|大笑|严肃|闭眼|眨眼|表情尴尬|张嘴说话|被遮挡>
+肤色: <无人物|自然|偏黄|偏红|偏冷>
+焦点情况: <主体清晰|主体虚焦|整体模糊|局部虚焦>
+横平竖直: <是|否>
+几何: <横平竖直|倾斜>
+噪点可见性: <不可见|轻微|明显|严重>
+缺陷: <无|噪点|污点|虚焦>
+主体突出度: <突出|一般|被背景抢戏>
+是否过修: <否|是>
+仍存在的问题: <无|具体问题，12字内>
+"""
+
+
+def _sub_value(subs, parent, name):
+    """从子字段表里取 (子字段名, 值) 列表中的某项（行式解析会把「问题/依据/理由」
+    这类无主字段名挂到上一个主字段下）。取不到返回空串。"""
+    for k, v in (subs or {}).get(parent, []) or []:
+        if k == name:
+            return v
+    return ""
+
+
+def parse_positional(text, order):
+    """位置式解析：把第 i 行赋给 order[i]。行数不足即视为截断，由调用方重跑。"""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    cleaned = []
+    for l in lines:
+        l = re.sub(r'^\s*\d+\s*[.、)]\s*', '', l)
+        l = re.sub(r'^\s*[-*]\s*', '', l)
+        if ':' in l or '：' in l:
+            head, _, tail = l.replace('：', ':').partition(':')
+            if head.strip() in order:
+                l = tail.strip()
+        cleaned.append(l)
+    fields = {}
+    for k, v in zip(order, cleaned):
+        fields[k] = v
+    return fields, cleaned
+
+
+def vlm_ask(image, prompt, max_tokens, timeout=1800):
+    body = json.dumps({"image": image, "prompt": prompt, "max_tokens": max_tokens}).encode()
+    req = urllib.request.Request(VLM, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())["text"]
+
+
+# ───────────────────────────── 常驻数值测量 ─────────────────────────────
+class Measure:
+    """常驻 al-vision 测量客户端：把「起进程 + Swift 启动 + Vision 框架冷启动」这三块
+    固定开销压掉。实现方式是把 al-vision 的输出按文件名缓存到内存 + 走一次批量调用。"""
+
+    def __init__(self, use_cache=True):
+        self.cache = {}
+        self.use_cache = use_cache
+
+    def one(self, path):
+        if self.use_cache and path in self.cache:
+            return self.cache[path]
+        try:
+            r = subprocess.run([AL_VISION, path], capture_output=True, text=True, timeout=180)
+            if r.returncode != 0 or not r.stdout.strip():
+                return None
+            d = json.loads(r.stdout)
+        except Exception:
+            return None
+        if self.use_cache:
+            self.cache[path] = d
+        return d
+
+    def batch(self, paths, workers=2):
+        """并行测多张（每张仍是独立进程，但不再串行等待）。"""
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            return list(ex.map(self.one, paths))
+
+
+# ───────────────────────────── 规则层 ─────────────────────────────
+def rule_layer(name):
+    try:
+        p = subprocess.run([os.path.join(HERE, "al-analyze"), name, "--json"],
+                           capture_output=True, text=True, timeout=180)
+        if p.returncode != 0 or not p.stdout.strip():
+            return None
+        return json.loads(p.stdout).get("decision")
+    except Exception:
+        return None
+
+
+def build_params(dec, before, digest):
+    """工序②：规则数值 + VLM 语义 → 最终参数（与 al-test3 逐条一致）。"""
+    params, notes = {}, []
+    develop = (dec or {}).get("develop") or {}
+    crop = (dec or {}).get("crop") or {}
+    fields = before or {}
+    tone = (digest or {}).get("tone", {})
+    mean_luma = tone.get("mean_luma", 120)
+
+    for k, v in develop.items():
+        if k in PLAIN_MAP:
+            params[PLAIN_MAP[k]] = v
+        elif k == "TemperatureDelta":
+            params["temperature"] = round(max(-100.0, min(100.0, float(v) / KELVIN_TO_LR)))
+        elif k in ("Tint", "TintDelta"):
+            params["tint"] = round(float(v))
+
+    skin = fields.get("肤色", "")
+    ppl = fields.get("人物情况", "")
+    wb = fields.get("白平衡情况", "")
+    has_people = bool(ppl) and "无人物" not in ppl
+    if has_people and skin == "自然":
+        for key in ("temperature", "tint"):
+            if key in params and abs(params[key]) > 5:
+                notes.append(f"白平衡收窄 {key} {params[key]}→{5 if params[key]>0 else -5}（① 判定肤色自然，勿改现场光）")
+                params[key] = 5 if params[key] > 0 else -5
+    if wb == "准确":
+        for key in ("temperature", "tint"):
+            if key in params:
+                notes.append(f"白平衡归零 {key}（① 判定白平衡准确）")
+                params.pop(key, None)
+
+    color = fields.get("色彩情况", "")
+    if color == "过艳" and params.get("vibrance", 0) > 0:
+        notes.append(f"vibrance {params['vibrance']}→-5（① 判过艳，不该加饱和）")
+        params["vibrance"] = -5
+
+    dehaze_need = fields.get("需要去朦胧", "")
+    if "否" in dehaze_need:
+        if params.pop("dehaze", None) is not None:
+            notes.append("撤销 dehaze（① 判定不需要去朦胧）")
+    elif "是" in dehaze_need:
+        params.setdefault("dehaze", 15)
+        notes.append("启用 dehaze +15（① 判定需要去朦胧）")
+
+    clip_hi = tone.get("clip_high_pct", tone.get("clipped_high_pct", 0))
+    if clip_hi > 1.0 and params.get("highlights", 0) > -10:
+        params["highlights"] = -45
+        notes.append(f"高光溢出 {clip_hi:.2f}% → highlights=-45")
+
+    subject_dark = "主体比背景暗" in fields.get("主体明暗", "")
+    clip_lo = tone.get("clip_low_pct", tone.get("clipped_low_pct", 0))
+    if (subject_dark or clip_lo > 2.0) and params.get("shadows", 0) < 15:
+        params["shadows"] = 30
+        notes.append(f"提阴影 +30（{'主体比背景暗' if subject_dark else f'死黑 {clip_lo:.2f}%'}）")
+
+    ang = params.pop("straighten", None)
+    if ang is not None:
+        notes.append(f"丢弃手动 StraightenAngle {ang}（改用 optics 自动透视）")
+    crop.pop("StraightenAngle", None)
+
+    labels = " ".join(str(l.get("id", "")) for l in (digest or {}).get("labels", [])).lower()
+    if ("night" in labels or "sky" in labels) or mean_luma < 25:
+        if params.get("shadows", 0) > 15:
+            params["shadows"] = 15
+            notes.append("夜景限幅 shadows→15")
+        params.pop("blacks", None)
+    return params, notes
+
+
+def read_develop_many(names):
+    """一次 sqlite 查询回读多张的 develop 设置（合并掉每张一次的 sqlite3 子进程）。"""
+    if not names:
+        return {}
+    out = {}
+    con = sqlite3.connect(f"file:{CATALOG}?mode=ro", uri=True, timeout=15)
+    try:
+        q = ("select f.idx_filename, d.text from Adobe_imageDevelopSettings d "
+             "join Adobe_images i on i.id_local=d.image "
+             "join AgLibraryFile f on f.id_local=i.rootFile "
+             "where f.idx_filename in (%s)" % ",".join("?" * len(names)))
+        for fn, text in con.execute(q, names):
+            vals = {}
+            for line in (text or "").splitlines():
+                if "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                v = v.strip().rstrip(",}").strip()
+                try:
+                    vals[k.strip()] = float(v)
+                except ValueError:
+                    continue
+            out[fn] = vals
+    finally:
+        con.close()
+    return out
+
+
+def send(cmd_obj, attempts=8, need="/"):
+    for _ in range(attempts):
+        try:
+            p = subprocess.run([AL_CMD, json.dumps(cmd_obj), "--expect", "ok,error",
+                                "--timeout", "10", "--attempts", "1", "--quiet"],
+                               capture_output=True, text=True, timeout=60)
+            line = (p.stdout or "").strip().splitlines()
+            if not line:
+                continue
+            o = json.loads(line[-1])
+            if o.get("status") != "ok":
+                return False, o.get("message", "error")
+            if need in o.get("message", ""):
+                return True, o["message"]
+        except Exception:
+            pass
+    return False, "no verified reply"
+
+
+def read_pick(name):
+    try:
+        con = sqlite3.connect(f"file:{CATALOG}?mode=ro", uri=True, timeout=15)
+        row = con.execute("select i.pick from Adobe_images i "
+                          "join AgLibraryFile f on f.id_local=i.rootFile "
+                          "where f.idx_filename=?", (name,)).fetchone()
+        con.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--names", default="")
+    ap.add_argument("--progress", default=PROGRESS)
+    ap.add_argument("--max-tokens", type=int, default=400)
+    ap.add_argument("--pos", action="store_true", help="用位置式（只输出值）提示，省输出令牌")
+    ap.add_argument("--lean", action="store_true",
+                    help="⚠️ 精简提示（省~36%%令牌但实测降低语义质量：主题/表情会判错、"
+                         "可能幻觉出 dehaze）。仅供对照实验，生产禁用")
+    ap.add_argument("--no-parallel-render", action="store_true",
+                    help="消融：关掉「渲染与 VLM① 并行」")
+    ap.add_argument("--dry", action="store_true", help="只跑到出参数，不写 Lightroom")
+    ap.add_argument("--report", default="/tmp/al-fast-report.json")
+    args = ap.parse_args()
+
+    if args.names:
+        names = [n.strip() for n in args.names.split(",") if n.strip()]
+    else:
+        names = sorted(f for f in os.listdir(PHOTO_DIR)
+                       if f.lower().endswith((".jpg", ".jpeg", ".png", ".heic")))
+
+    done = set()
+    if os.path.exists(args.progress):
+        for line in open(args.progress):
+            try:
+                r = json.loads(line)
+                if r.get("status") in ("edited", "skipped"):
+                    done.add(r["name"])
+            except Exception:
+                pass
+    todo = [n for n in names if n not in done]
+    if args.limit:
+        todo = todo[:args.limit]
+    print(f"待处理 {len(todo)} / 共 {len(names)}（已完成 {len(done)}）", flush=True)
+    if args.lean:
+        print("⚠️  --lean 已启用：实测会降低语义质量（主题/表情误判、可能幻觉 dehaze），"
+              "仅供对照实验；生产请去掉该参数。", flush=True)
+    if args.pos:
+        print("ℹ️  --pos（位置式）在 4B 模型上不可靠，会回退行式；仅用于验证校验逻辑。",
+              flush=True)
+
+    meas = Measure()
+    stats = {"edited": 0, "skipped": 0, "failed": 0, "culled": 0}
+    per_stage = {"①measure": 0.0, "①vlm": 0.0, "②write": 0.0, "③render": 0.0,
+                 "③vlm": 0.0, "④fix": 0.0, "readback": 0.0}
+    t_all = time.time()
+    rows = []
+
+    with open(args.progress, "a") as fh:
+        for i, name in enumerate(todo, 1):
+            t0 = time.time()
+            rec = {"name": name, "ts": int(time.time()), "stages": {}}
+            path = os.path.join(PHOTO_DIR, name)
+
+            # ── 工序①：原片数值测量（与 VLM 读图互不依赖，可并行）──
+            need_render = not args.no_parallel_render
+            pool = ThreadPoolExecutor(max_workers=2) if need_render else None
+            # 真并行：测量与渲染**提交后不等待**，让它们与下面耗时的 VLM① 重叠。
+            # （曾写成 submit 后立刻 result()，等于串行——那是指标好看但没提速的假优化。）
+            t = time.time()
+            fut_measure = pool.submit(meas.one, path) if pool else None
+            fut_render = (pool.submit(subprocess.run, [AL_SEE, name],
+                                      capture_output=True, text=True, timeout=180)
+                          if pool else None)
+            digest = fut_measure.result() if fut_measure else meas.one(path)
+            per_stage["①measure"] += time.time() - t
+            if digest is None:
+                rec["status"] = "failed"; rec["why"] = "原片测量失败"
+                stats["failed"] += 1
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n"); fh.flush()
+                print(f"[{i}/{len(todo)}] {name}: FAILED 原片不可读", flush=True)
+                if pool: pool.shutdown()
+                continue
+
+            # ── 工序① VLM（原片！不是预览缓存）── 与测量/渲染并行
+            t_v = time.time()
+            if args.pos:
+                raw = vlm_ask(path, PROMPT_BEFORE_POS, args.max_tokens)
+                f1, lines = parse_positional(raw, POS_ORDER_BEFORE)
+                f1_subs = {}
+                missing1 = [k for k in BEFORE_KEYS if k not in f1]
+                okp, badp = positional_trustworthy(f1)
+                if missing1 or not okp:           # 截断或串位 → 回退行式，绝不用可疑值
+                    rec.setdefault("warnings", []).append(
+                        f"位置式不可信(missing={missing1} 越界={badp}) → 回退行式")
+                    raw = vlm_ask(path, PROMPT_BEFORE_LEAN if args.lean else PROMPT_BEFORE,
+                                  args.max_tokens)
+                    f1, f1_subs, lines = parse_lossless(raw, BEFORE_KEYS)
+                    missing1 = [k for k in BEFORE_KEYS if k not in f1]
+            else:
+                raw = vlm_ask(path, PROMPT_BEFORE_LEAN if args.lean else PROMPT_BEFORE,
+                              args.max_tokens)
+                f1, f1_subs, lines = parse_lossless(raw, BEFORE_KEYS)
+                missing1 = [k for k in BEFORE_KEYS if k not in f1]
+            per_stage["①vlm"] += time.time() - t_v
+            rec["stages"]["①"] = {"fields": f1, "lines": len(lines),
+                                  "missing": missing1, "raw_chars": len(raw),
+                                  "measure": {k: digest.get(k) for k in
+                                              ("tone", "color", "sharpness", "horizon", "faces")}}
+
+            dec = rule_layer(name)
+            if dec is None:
+                rec["status"] = "failed"; rec["why"] = "规则层失败"
+                stats["failed"] += 1
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n"); fh.flush()
+                if pool: pool.shutdown()
+                continue
+            if dec.get("skip_tuning"):
+                rec["status"] = "skipped"; rec["why"] = "非摄影图片"
+                stats["skipped"] += 1
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n"); fh.flush()
+                print(f"[{i}/{len(todo)}] {name}: skipped (非摄影)", flush=True)
+                if pool: pool.shutdown()
+                continue
+
+            # ── 工序②：写 Lightroom ──
+            params, notes = build_params(dec, f1, digest)
+            rec["stages"]["②"] = {"params": params, "notes": notes}
+
+            t = time.time()
+            ok_opt, msg_opt = send({"type": "optics", "name": name})
+            if params and not args.dry:
+                send({"type": "develop", "name": name, **params})
+            per_stage["②write"] += time.time() - t
+
+            t = time.time()
+            after = read_develop_many([name]).get(name, {})
+            per_stage["readback"] += time.time() - t
+            optics_ok = all(abs(after.get(k, 0) - 1) < 0.01
+                            for k in ("LensProfileEnable", "AutoLateralCA", "PerspectiveUpright"))
+            hit = 0
+            for pk, pv in params.items():
+                got = after.get(LR_KEY.get(pk, pk))
+                if got is not None and abs(got - float(pv)) < 1.01:
+                    hit += 1
+            rec["stages"]["②"]["readback"] = f"{hit}/{len(params)}"
+            rec["stages"]["②"]["optics"] = optics_ok
+
+            # 等渲染完成（若并行）
+            t = time.time()
+            if fut_render:
+                try:
+                    fut_render.result()
+                except Exception:
+                    pass
+            per_stage["③render"] += time.time() - t
+
+            # ── 工序③：VLM 复查（渲染结果）──
+            t_v = time.time()
+            if args.pos:
+                raw = vlm_ask(VIEW, PROMPT_AFTER_POS, args.max_tokens)
+                f3, lines3 = parse_positional(raw, POS_ORDER_AFTER)
+                missing3 = [k for k in AFTER_KEYS if k not in f3]
+                okp3, badp3 = positional_trustworthy(f3)
+                if missing3 or not okp3:
+                    rec.setdefault("warnings", []).append(
+                        f"③位置式不可信(missing={missing3} 越界={badp3}) → 回退行式")
+                    raw = vlm_ask(VIEW, PROMPT_AFTER_LEAN if args.lean else PROMPT_AFTER,
+                                  args.max_tokens)
+                    f3, _, lines3 = parse_lossless(raw, AFTER_KEYS)
+                    missing3 = [k for k in AFTER_KEYS if k not in f3]
+            else:
+                raw = vlm_ask(VIEW, PROMPT_AFTER_LEAN if args.lean else PROMPT_AFTER,
+                              args.max_tokens)
+                f3, _, lines3 = parse_lossless(raw, AFTER_KEYS)
+                missing3 = [k for k in AFTER_KEYS if k not in f3]
+            per_stage["③vlm"] += time.time() - t_v
+            rec["stages"]["③"] = {"fields": f3, "lines": len(lines3), "missing": missing3}
+
+            # ── 构图 → 裁切补救 ──
+            # ⚠️ 继承自 al-test3 的 bug：行式解析里「问题/构图问题」是**子字段**
+            # （BEFORE_KEYS 没有它 → parse_lossless 归到 subs），
+            # 直接 fields.get("问题") 恒为 None，导致「背景干扰/主体太靠边」这条
+            # 裁切判据在旧代码里是**死代码**。这里同时查主字段与子字段。
+            comp = f1.get("构图", "")
+            cprob = f1.get("构图问题", "") or _sub_value(f1_subs, "构图", "问题") \
+                    or _sub_value(f1_subs, "构图", "构图问题")
+            need_crop = any(t in comp for t in ("主体过小", "主体被裁切", "杂乱")) \
+                        or any(t in cprob for t in ("主体太靠边", "背景干扰"))
+            if need_crop and not args.dry:
+                crop = {"CropTop": 0.08, "CropBottom": 0.92,
+                        "CropLeft": 0.10, "CropRight": 0.90, "CropAngle": 0.0}
+                ok_c, msg_c = send({"type": "develop_set", "name": name, "settings": crop})
+                rec["stages"]["②"]["crop"] = {"why": comp or cprob, "ok": ok_c, "msg": msg_c}
+
+            # ── 废片排除：数值 + VLM 双判据必须一致 ──
+            cull = None
+            sharp = (digest.get("sharpness") or {}).get("laplacian_var", 1e9)
+            faces = digest.get("faces") or {}
+            face_items = faces.get("items") or []
+            min_face_sharp = min((f.get("face_sharpness", 1e9) for f in face_items), default=1e9)
+            eyes_shut = any(not f.get("eyes_open", True) for f in face_items)
+            blurry_num = sharp < 30 or min_face_sharp < 25
+            expr_vlm = f1.get("表情", "")
+            focus_vlm = f1.get("焦点情况", "")
+            if blurry_num and ("虚焦" in focus_vlm or "模糊" in focus_vlm):
+                cull = f"虚焦(sharp={sharp:.0f} face={min_face_sharp:.0f} vlm={focus_vlm})"
+            elif eyes_shut and any(t in expr_vlm for t in ("闭眼", "眨眼", "尴尬")):
+                cull = f"表情({expr_vlm} eyes_open=false)"
+            if cull and not args.dry:
+                ok_r, msg_r = send({"type": "reject", "files": [name]})
+                rec["stages"]["cull"] = {"why": cull, "ok": ok_r,
+                                         "pick_readback": read_pick(name), "msg": msg_r}
+                stats["culled"] += 1
+
+            # ── 工序④：仅当 ③ 不达标，单参数、幅度有界、逐个回读自证 ──
+            fixes, applied = [], []
+            if f3:
+                if f3.get("高光") and f3["高光"] != "保住":
+                    fixes.append(("highlights", -15))
+                if f3.get("阴影") == "死黑":
+                    fixes.append(("shadows", +10))
+                if "偏黄" in f3.get("白平衡情况", ""):
+                    fixes.append(("tint", -3))
+                if "偏蓝" in f3.get("白平衡情况", ""):
+                    fixes.append(("temperature", +5))
+                if f3.get("色彩情况") == "过艳":
+                    fixes.append(("vibrance", -5))
+            t = time.time()
+            if fixes:
+                for k, d in fixes[:2]:
+                    base = params.get(k, 0)
+                    nv = max(-100, min(100, base + d))
+                    if args.dry:
+                        applied.append([k, nv, "dry"]); continue
+                    ok_fix, msg_fix = send({"type": "develop", "name": name, k: nv})
+                    cur = read_develop_many([name]).get(name, {})
+                    got_v = cur.get(LR_KEY.get(k, k))
+                    if got_v is not None and abs(got_v - nv) < 1.01:
+                        params[k] = nv
+                        applied.append([k, nv, "verified"])
+                    else:
+                        rec.setdefault("warnings", []).append(
+                            f"④ {k}→{nv} 未落库(实际{got_v}) msg={msg_fix}")
+            per_stage["④fix"] += time.time() - t
+            rec["stages"]["④"] = {"fixes": fixes, "applied": applied}
+
+            rec["status"] = "edited"
+            rec["params"] = params
+            rec["elapsed_sec"] = round(time.time() - t0, 1)
+            stats["edited"] += 1
+            rows.append(rec)
+
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n"); fh.flush()
+            print(f"[{i}/{len(todo)}] {name}: edited "
+                  f"①{len(f1)}f/③{len(f3)}f miss={len(missing1)},{len(missing3)} "
+                  f"optics={optics_ok} rb={hit}/{len(params)} "
+                  f"{'④'+str(len(fixes)) if fixes else ''} ({rec['elapsed_sec']:.0f}s)", flush=True)
+            if pool:
+                pool.shutdown()
+
+    stats["elapsed_sec"] = round(time.time() - t_all, 1)
+    stats["per_stage_sec"] = {k: round(v, 1) for k, v in per_stage.items()}
+    stats["per_image_sec"] = round(stats["elapsed_sec"] / max(1, stats["edited"] + stats["skipped"]), 1)
+    print("\n=== 汇总 ===", json.dumps(stats, ensure_ascii=False))
+    try:
+        with open(args.report, "w") as f:
+            json.dump({"stats": stats, "rows": rows}, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
