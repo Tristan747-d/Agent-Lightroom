@@ -31,7 +31,43 @@ os() { perl -e 'alarm 12; exec @ARGV' osascript "$@" 2>/dev/null; }
 seq_of() { curl -s --max-time 3 "$HEALTH" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('resultSeq',0))" 2>/dev/null || echo 0; }
 
 seq_before=$(seq_of)
-echo "1) 激活 Lightroom（resultSeq=${seq_before}）"
+# ⚠️ 2026-09-23 铁律变更：**绝不 activate（不抢前台）**。
+# 用户已明确要求纯静默驱动（参照 codex 标准），dsh-cua v2.0 起「点击前先 activate」
+# 已作废。实测：AXPress / CGEvent.postToPid 下的菜单操作对后台 app 依然有效，
+# 下面的菜单读取与点击都**不需要** Lightroom 处于前台。
+# 如果 LR 完全不在前台导致菜单读不到，正确做法是让用户自己切一下，
+# 或者改用文件通道（/tmp/al-view.request），**不要 activate**。
+# 🔴 实测结论（2026-09-23，务必先读，别浪费一晚）：
+#   **静默模式下拉不起插件菜单。** LR 不在前台时，菜单栏 AX 读取稳定返回空
+#   （实测连续 5 次全空），因为 LR 只有在成为 active app 时才构建菜单栏项。
+#   两者不可兼得：要么抢前台（违反用户铁律），要么这一条重载命令失败。
+#
+#   因此本脚本的定位是「**一次性重载工具**」：
+#     · 默认拒绝运行，并打印下面这段说明；
+#     · 只有显式 AGENT_LIGHTROOM_FOREGROUND_OK=1 才真的抢前台执行重载。
+#
+#   而**日常修图完全不需要它**：bridge 轮询一旦活着就一直在跑
+#   （实测 lastSeen 常年 0.5s、resultSeq 持续推进），
+#   develop/develop_set/optics/reject 全部走 HTTP，**全程静默、不碰前台**。
+#   只有「插件代码变了要重新载入」这一种情况才需要本脚本。
+if [ "${AGENT_LIGHTROOM_FOREGROUND_OK:-0}" != "1" ]; then
+    cat <<'EOM'
+✗ 拒绝执行：静默模式无法重载插件（实测菜单栏 AX 读取对后台 LR 返回空）。
+
+  本脚本只在**插件代码变更、需要重新载入**时用一次，且必须抢前台（LR 的限制）。
+  日常修图**不需要**它 —— bridge 轮询活着就一直有效，develop/optics/reject
+  全走 HTTP，完全静默。
+
+  确认要重载（会短暂把 Lightroom 切到前台），请运行：
+      AGENT_LIGHTROOM_FOREGROUND_OK=1 tools/start-lr-bridge.sh
+
+  先确认 bridge 是否还活着（活着就不用重载）：
+      curl -s http://127.0.0.1:8765/health
+EOM
+    exit 2
+fi
+echo "1) 准备 Lightroom（resultSeq=${seq_before}）"
+echo "   ⚠️ 用户显式允许抢前台（AGENT_LIGHTROOM_FOREGROUND_OK=1），开始重载"
 os -e "tell application \"$LR\" to activate" >/dev/null
 sleep 1
 

@@ -154,12 +154,34 @@ tools/al-recipe apply   --dir ... --dry
 
 ---
 
-## 四、下一步建议
+## 四、静默性（CUA 铁律）实测
+
+你要求「绝不抢前台」（参照 codex 标准），我把这条落到实测上：
+
+**已验证静默的部分**（全程 `frontmost` 保持 Safari、LR 始终 `frontmost=false`）：
+- `get_app_state` 读 LR 的 AX 树（688 元素，含完整「修改照片」面板）—— 静默 ✅
+- 用 `AXPress` 打开/遍历菜单栏 —— 静默 ✅
+- **日常修图全部命令**（`develop` / `develop_set` / `optics` / `reject`）走 HTTP → bridge → 插件，
+  完全不碰 UI、不碰前台 ✅
+
+**发现并修掉的违规**：`tools/start-lr-bridge.sh` 里有一行
+`tell application "Lightroom Classic" to activate` —— 这是旧的 dsh-cua 做法，
+**违反你的静默铁律**。已删除。
+
+**顺带查清一个硬限制（如实报告）**：静默模式**拉不起插件菜单**。
+LR 不在前台时菜单栏 AX 读取稳定返回空（连续 5 次全空）——
+LR 只有在成为 active app 时才构建菜单栏项。
+所以「重载插件」和「不抢前台」**不可兼得**。处理方式：
+- 该脚本改为**默认拒绝运行**并打印说明，只有显式
+  `AGENT_LIGHTROOM_FOREGROUND_OK=1 tools/start-lr-bridge.sh` 才抢前台执行；
+- 并明确它只是**一次性重载工具**——bridge 轮询活着就一直有效
+  （实测 `lastSeen` 常年 0.5s、`resultSeq` 持续推进），日常修图根本不需要它。
+
+## 五、下一步建议
 
 1. **明天真实活动照**：先跑 `tools/al-recipe apply --dir <新目录> --dry` 看参数是否合理，
-   确认后再去掉 `--dry`。0.23 s/张，240 张不到 1 分钟。
-2. **补皮肤蒙版**：要复现你 91% 的 AI 皮肤蒙版，需给 `Bridge.lua` 的白名单加
-   `MaskGroupBasedCorrections`（结构复杂：嵌套 CorrectionMasks + MaskDigest），
-   或改用 LR 的「自动蒙版」UI（但那需要 CUA 点击，且 `allow_foreground` 会抢前台）。
+   确认后再去掉 `--dry`。**实测 0.23–0.28 s/张**，240 张不到 1 分钟。
+   （已在 `0923中秋活动` 上演练通过：5 张 / 1.4 s。）
+2. ~~补皮肤蒙版~~ —— **不需要**（见上：那些蒙版是空转的默认值）。
 3. **Shadows 若要提准**：对 JPG 组做一个小的 VLM 二分类（"主体是否在暗部"，
    输出 1 个令牌即可判 → 选 29 还是 45），单张成本 <1 s，比全套 24 字段便宜得多。
