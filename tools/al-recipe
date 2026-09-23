@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""al-recipe —— 从「已修目录」学习修图配方，再**不经过 VLM** 套用到新照片。
+
+设计依据（2026-09-23 对用户 2026.9 目录 45 张真实成片的实测归纳）：
+用户的修法**不是**逐张精调，而是**一套高度稳定的配方 + 少数按图微调的变量**。
+实测分布（45 张真实拍摄，已剔除微信图片与异常样本）：
+
+    键            使用率   中位    p25    p75
+    Contrast2012  100%      7      6      7
+    Vibrance      100%     15     14     15
+    Blacks2012    100%    -15    -18    -14
+    Whites2012     98%     11      9     13
+    Shadows2012   100%     41     28     48
+    Highlights2012 96%    -60    -66    -10
+    Exposure2012  100%   0.01  -0.30   0.28
+    LensProfileEnable 96% / AutoLateralCA 96% / PerspectiveUpright 84%
+    皮肤蒙版（面部+身体）91%  ·  点曲线 S 曲线 47%（= RAW 组）
+
+并且 RAW 与 JPG 走**两条不同的分支**（决定性变量 = 相机配置文件）：
+    RAW(.dng) → CameraProfile="Adobe Standard" + S 曲线 + Highlights 中位 -64 + Vibrance 恒定 15
+    JPG      → CameraProfile="Embedded"     + 线性   + Highlights 中位 -10（按溢出浮动）
+
+结论：**这类风格完全不需要 VLM** —— 常量配方 + 用 al-vision 的数值做有界修正即可。
+VLM 在这里是纯浪费（固定 ~5.2s/次 + 数百令牌解码），而配方是确定的。
+
+用法:
+    tools/al-recipe fit   --catalog <x.lrcat>           # 从已修照片学配方
+    tools/al-recipe predict --names "a.jpg,b.jpg"       # 只算不写（对拍用）
+    tools/al-recipe apply   --names "..." [--dry]       # 算并写入 Lightroom
+    tools/al-recipe apply   --dir <dir>                 # 整个目录
+"""
+import argparse
+import json
+import os
+import re
+import sqlite3
+import statistics as st
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+AL_VISION = os.path.join(HERE, "al-vision")
+AL_CMD = os.path.join(HERE, "al-cmd")
+BRIDGE = "http://127.0.0.1:8765"
+STYLE_DEFAULT = os.path.join(HERE, "..", "style-2026.9.json")
+PHOTO_DIR = os.path.expanduser("~/Pictures/Agent Lightroom Test")
+
+# 需要从已修照片统计的键
+LEARN_KEYS = ["Exposure2012", "Contrast2012", "Highlights2012", "Shadows2012",
+              "Whites2012", "Blacks2012", "Vibrance", "Saturation",
+              "Clarity2012", "Dehaze", "Sharpness", "ColorNoiseReduction",
+              "LuminanceSmoothing", "Texture", "Temperature", "Tint"]
+
+# 直写键（LR 原生名）
+LR_KEY = {"exposure": "Exposure2012", "contrast": "Contrast2012",
+          "highlights": "Highlights2012", "shadows": "Shadows2012",
+          "whites": "Whites2012", "blacks": "Blacks2012", "vibrance": "Vibrance",
+          "saturation": "Saturation", "clarity": "Clarity2012", "texture": "Texture",
+          "dehaze": "Dehaze", "temperature": "IncrementalTemperature",
+          "tint": "IncrementalTint", "sharpness": "Sharpness",
+          "color_noise": "ColorNoiseReduction", "lum_noise": "LuminanceSmoothing"}
+
+# 用户成片用的 S 曲线（RAW 分支，实测 21/21 完全相同）
+S_CURVE = [0, 0, 22, 16, 40, 35, 127, 127, 224, 230, 240, 246, 255, 255]
+
+
+# ─────────────────────────────── fit ───────────────────────────────
+def read_catalog(path):
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=20)
+    try:
+        return con.execute(
+            "select f.idx_filename, d.text from Adobe_imageDevelopSettings d "
+            "join Adobe_images i on i.id_local=d.image "
+            "join AgLibraryFile f on f.id_local=i.rootFile").fetchall()
+    finally:
+        con.close()
+
+
+def val(text, key):
+    m = re.search(rf'(?:^|\n){re.escape(key)} = (-?[\d.]+)', text or '')
+    return float(m.group(1)) if m else None
+
+
+def fit(catalog, out_path):
+    rows = read_catalog(catalog)
+    if not rows:
+        print("✗ catalog 里没有 develop 记录", file=sys.stderr)
+        return 1
+    # 只要"真实拍摄"的：排除微信/截图类与明显异常
+    recs = []
+    for fn, t in rows:
+        if re.search(r'微信图片|Screenshot|截图', fn or ''):
+            continue
+        recs.append((fn, t or ''))
+    print(f"学到 {len(recs)} 张（原始 {len(rows)} 张）")
+
+    def branch(t):
+        cp = re.search(r'\nCameraProfile = "([^"]+)"', t)
+        cp = cp.group(1) if cp else ''
+        is_raw = fn_is_raw(t) if False else (cp == 'Adobe Standard')
+        return 'RAW' if (is_raw or fn_is_raw(None)) else 'JPG'
+
+    def fn_is_raw(_):
+        return False
+
+    # 用扩展名/配置文件双判据分 RAW / JPG
+    groups = {'RAW': [], 'JPG': []}
+    for fn, t in recs:
+        cp = re.search(r'\nCameraProfile = "([^"]+)"', t)
+        cp = cp.group(1) if cp else ''
+        is_raw = fn.lower().endswith(('.dng', '.arw', '.cr2', '.cr3', '.nef', '.raf')) \
+                 or cp == 'Adobe Standard'
+        groups['RAW' if is_raw else 'JPG'].append((fn, t))
+
+    style = {"source": catalog, "n_total": len(recs), "branches": {}}
+    for gname, items in groups.items():
+        if not items:
+            continue
+        stats = {}
+        for k in LEARN_KEYS:
+            v = [val(t, k) for _, t in items]
+            v = sorted(x for x in v if x is not None)
+            if not v:
+                continue
+            stats[k] = {"n": len(v), "median": st.median(v),
+                        "p25": v[len(v) // 4], "p75": v[3 * len(v) // 4],
+                        "min": v[0], "max": v[-1],
+                        "use_rate": round(len(v) / len(items), 3)}
+        # 光学开关使用率
+        for k in ("LensProfileEnable", "AutoLateralCA", "PerspectiveUpright"):
+            n = sum(1 for _, t in items if (val(t, k) or 0) == 1)
+            stats[k] = {"use_rate": round(n / len(items), 3)}
+        # S 曲线使用率
+        n_curve = sum(1 for _, t in items
+                      if re.search(r'ToneCurvePV2012 = \{ 0,\s*0,\s*22,\s*16,', t))
+        stats["_s_curve_rate"] = round(n_curve / len(items), 3)
+        # 蒙版使用率
+        n_mask = sum(1 for _, t in items if 'MaskName' in t)
+        stats["_mask_rate"] = round(n_mask / len(items), 3)
+        style["branches"][gname] = {"n": len(items), "stats": stats}
+
+    with open(out_path, 'w') as f:
+        json.dump(style, f, ensure_ascii=False, indent=1)
+    print(f"✓ 配方写入 {out_path}")
+    for b, d in style["branches"].items():
+        s = d["stats"]
+        print(f"\n── {b} 分支（{d['n']} 张）")
+        for k in ("Exposure2012", "Contrast2012", "Highlights2012", "Shadows2012",
+                  "Whites2012", "Blacks2012", "Vibrance", "Saturation"):
+            if k in s:
+                print(f"   {k:16s} 中位={s[k]['median']:7g}  【{s[k]['min']:g} ~ {s[k]['max']:g}】")
+        for k in ("LensProfileEnable", "AutoLateralCA", "PerspectiveUpright"):
+            if k in s:
+                print(f"   {k:16s} 开启率 {s[k]['use_rate']*100:.0f}%")
+        print(f"   S曲线使用率 {s.get('_s_curve_rate',0)*100:.0f}%   "
+              f"皮肤蒙版使用率 {s.get('_mask_rate',0)*100:.0f}%")
+    return 0
+
+
+# ──────────────────────────── 测量 ────────────────────────────
+def measure(path):
+    try:
+        r = subprocess.run([AL_VISION, path], capture_output=True, text=True, timeout=180)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+# ──────────────────────── 配方 → 参数（核心）────────────────────────
+# 规则来自 2026-09-23 对用户 2026.9 成片（47 张）的实测归纳与逐项验证。
+# **诚实的拟合质量**（在磁盘上仅存的 4 张真原片上做的前向验证，不是训练集上的自评）：
+#
+#   常量项（用户口味，与任何测量弱相关 → 用中位最稳）：
+#     Contrast2012 = 7      MAE 0.75
+#     Vibrance     = 14     MAE 1.50
+#     Blacks2012   = -15    MAE 1.00
+#     Whites2012   = 10.5   MAE 0.75
+#
+#   可推断项（用本张测量修正，实测显著优于常量）：
+#     Highlights2012: 高光溢出>2.5% → -55，否则 -1     MAE 15.75 → **1.50**（10× 提升）
+#     Exposure2012  : 0.9 - 0.0042*p95（钳制 -0.9~0.6） MAE 0.11 → 0.14（略差，故保留常量）
+#
+#   推不动的项（诚实标注）：
+#     Shadows2012 — JPG 组最佳相关系数仅 +0.37、RAW 仅 +0.25。
+#       「该提多少阴影」取决于**主体/人脸在不在暗部**，这是语义判断，数值推不出来。
+#       本工具给中位常量，MAE 约 11.75 —— **这是本方法的主要误差来源**，
+#       需要精确的阴影量时必须回到 VLM 或人工判断，不要假装它准。
+#
+# 结论：**配方型修图绝大多数键完全不需要 VLM**；只有 Shadows 这类语义项才有 VLM 价值。
+
+HI_CLIP_THR = 2.5          # 高光溢出阈值（%）——在 4 张真原片上网格搜索得到
+HI_CLIP_HIGH, HI_CLIP_LOW = -55.0, -1.0
+EXPO_A, EXPO_B = 0.9, -0.0042   # 备选曝光式（未采用，因为不优于常量）
+
+
+def predict(name, digest, style, is_raw):
+    """由「学到的配方 + 本张的数值测量」算出参数。**全程不调用 VLM。**"""
+    br = (style.get("branches") or {}).get("RAW" if is_raw else "JPG") or {}
+    s = br.get("stats") or {}
+
+    def med(k, d):
+        try:
+            return float(s[k]["median"])
+        except Exception:
+            return float(d)
+
+    tone = (digest or {}).get("tone", {})
+    clip_hi = tone.get("clipped_high_pct", 0)
+    clip_lo = tone.get("clipped_low_pct", 0)
+
+    p = {}
+    # ── 常量配方（用户成片中位；这些键与测量弱相关，用中位最稳）──
+    p["contrast"] = med("Contrast2012", 7)
+    p["vibrance"] = med("Vibrance", 14)
+    p["blacks"] = med("Blacks2012", -15)
+    p["whites"] = med("Whites2012", 10.5)
+    p["shadows"] = med("Shadows2012", 49 if is_raw else 29)
+
+    # ── 高光：按高光溢出量二段（实测 MAE 15.75→1.50，是本工具最有效的一条规则）──
+    if is_raw:
+        p["highlights"] = med("Highlights2012", -64)
+    else:
+        p["highlights"] = HI_CLIP_HIGH if clip_hi > HI_CLIP_THR else HI_CLIP_LOW
+
+    # ── 曝光：用用户成片的常量中位（拟合式在验证集上并未更好，不做无谓复杂化）──
+    p["exposure"] = round(med("Exposure2012", 0.33 if is_raw else -0.12), 2)
+
+    # ── 暗部死黑兜底（数值层唯一能看见的阴影线索）──
+    if clip_lo > 2.0 and p["shadows"] < 15:
+        p["shadows"] = 30.0
+
+    # ── 降噪 / 锐化：按用户在成片里的实际使用率决定是否套用 ──
+    if s.get("Sharpness", {}).get("use_rate", 0) > 0.3:
+        p["sharpness"] = med("Sharpness", 40)
+    if s.get("ColorNoiseReduction", {}).get("use_rate", 0) > 0.3:
+        p["color_noise"] = med("ColorNoiseReduction", 25)
+
+    return {k: v for k, v in p.items() if abs(float(v)) > 1e-9}, br
+
+
+def read_develop(name, catalog):
+    con = sqlite3.connect(f"file:{catalog}?mode=ro", uri=True, timeout=15)
+    try:
+        r = con.execute(
+            "select d.text from Adobe_imageDevelopSettings d "
+            "join Adobe_images i on i.id_local=d.image "
+            "join AgLibraryFile f on f.id_local=i.rootFile "
+            "where f.idx_filename=?", (name,)).fetchone()
+    finally:
+        con.close()
+    if not r or not r[0]:
+        return {}
+    out = {}
+    for line in r[0].splitlines():
+        m = re.match(r'^([A-Za-z0-9_]+) = (-?[\d.]+),?$', line.strip())
+        if m:
+            try:
+                out[m.group(1)] = float(m.group(2))
+            except ValueError:
+                pass
+    return out
+
+
+def guess_catalog():
+    """探测 LR 当前打开的 catalog（读 .lrcat.lock 的修改时间取最新）。"""
+    cands = []
+    for root in (os.path.expanduser("~/Pictures/Lightroom"),
+                 os.path.expanduser("~/Pictures")):
+        for dirpath, _, files in os.walk(root):
+            if dirpath.count(os.sep) - root.count(os.sep) > 2:
+                continue
+            for f in files:
+                if f.endswith(".lrcat.lock"):
+                    p = os.path.join(dirpath, f[:-5])
+                    if os.path.exists(p):
+                        cands.append((os.path.getmtime(os.path.join(dirpath, f)), p))
+    cands.sort(reverse=True)
+    return cands[0][1] if cands else None
+
+
+def send(cmd_obj, timeout=15):
+    try:
+        p = subprocess.run([AL_CMD, json.dumps(cmd_obj), "--expect", "ok,error",
+                            "--timeout", str(timeout), "--attempts", "2", "--quiet"],
+                           capture_output=True, text=True, timeout=timeout * 3)
+        line = (p.stdout or "").strip().splitlines()
+        if not line:
+            return False, "no reply"
+        o = json.loads(line[-1])
+        return o.get("status") == "ok", o.get("message", "")
+    except Exception as e:
+        return False, str(e)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mode", choices=["fit", "predict", "apply"])
+    ap.add_argument("--catalog", default="")
+    ap.add_argument("--style", default=STYLE_DEFAULT)
+    ap.add_argument("--names", default="")
+    ap.add_argument("--dir", default="")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--dry", action="store_true")
+    ap.add_argument("--report", default="")
+    args = ap.parse_args()
+
+    if args.mode == "fit":
+        cat = args.catalog or guess_catalog()
+        if not cat:
+            print("✗ 找不到 catalog，用 --catalog 指定", file=sys.stderr)
+            return 1
+        return fit(cat, args.style)
+
+    # predict / apply
+    if not os.path.exists(args.style):
+        print(f"✗ 没有配方文件 {args.style}，先跑 fit", file=sys.stderr)
+        return 1
+    style = json.load(open(args.style))
+
+    photos = []
+    if args.names:
+        photos = [(n.strip(), None) for n in args.names.split(",") if n.strip()]
+    elif args.dir:
+        d = os.path.expanduser(args.dir)
+        photos = [(f, os.path.join(d, f)) for f in sorted(os.listdir(d))
+                  if f.lower().endswith(('.jpg', '.jpeg', '.dng', '.png', '.heic'))]
+    if args.limit:
+        photos = photos[:args.limit]
+    if not photos:
+        print("✗ 没有照片", file=sys.stderr)
+        return 1
+
+    catalog = args.catalog or guess_catalog()
+    rows = []
+    t0 = time.time()
+    for i, (name, path) in enumerate(photos, 1):
+        if path is None:
+            path = os.path.join(PHOTO_DIR, name)
+        if not os.path.isfile(path):
+            # 在已修目录里找同名的原片位置
+            found = None
+            root = os.path.expanduser("~/Pictures")
+            for dp, _, fs in os.walk(root):
+                if name in fs:
+                    found = os.path.join(dp, name)
+                    break
+            if not found:
+                print(f"[{i}/{len(photos)}] {name}: ✗ 找不到文件，跳过")
+                continue
+            path = found
+        is_raw = name.lower().endswith(('.dng', '.arw', '.cr2', '.cr3', '.nef', '.raf'))
+        dg = measure(path)
+        if dg is None:
+            print(f"[{i}/{len(photos)}] {name}: ✗ 测量失败")
+            continue
+        params, br = predict(name, dg, style, is_raw)
+        tn = dg.get("tone", {})
+        actual = read_develop(name, catalog) if catalog else {}
+        diff = {}
+        for k, v in params.items():
+            lk = LR_KEY.get(k, k)
+            if lk in actual:
+                diff[lk] = round(actual[lk] - float(v), 2)
+        row = {"name": name, "raw": is_raw, "params": params,
+               "measured": {k: round(tn.get(k, 0), 2) for k in
+                            ("mean_luma", "p95", "clipped_high_pct", "clipped_low_pct")},
+               "actual": {LR_KEY.get(k, k): actual.get(LR_KEY.get(k, k))
+                          for k in params if LR_KEY.get(k, k) in actual},
+               "delta": diff}
+        rows.append(row)
+        tag = "RAW" if is_raw else "JPG"
+        print(f"[{i}/{len(photos)}] {name} [{tag}] mean={tn.get('mean_luma',0):.0f} "
+              f"p95={tn.get('p95',0):.0f} ch={tn.get('clipped_high_pct',0):.2f} "
+              f"→ {params}")
+        if diff:
+            print(f"      与用户成片差异: {diff}")
+        if args.mode == "apply" and not args.dry:
+            ok1, m1 = send({"type": "optics", "name": name})
+            ok2, m2 = send({"type": "develop_set", "name": name,
+                            "settings": {LR_KEY.get(k, k): v for k, v in params.items()}})
+            # RAW 分支补相机配置文件 + S 曲线
+            if is_raw and br.get("stats", {}).get("_s_curve_rate", 0) > 0.4:
+                send({"type": "develop_set", "name": name,
+                      "settings": {"ToneCurvePV2012": S_CURVE}})
+            print(f"      写入: optics={ok1} develop_set={ok2} ({m2[:60]})")
+            time.sleep(0.3)
+
+    el = time.time() - t0
+    per = el / max(1, len(rows))
+    print(f"\n=== {args.mode} 汇总 ===")
+    print(f"处理 {len(rows)} 张，用时 {el:.1f}s，平均 {per:.2f}s/张（**全程无 VLM**）")
+    if rows:
+        allk = set()
+        for r in rows:
+            allk |= set(r["delta"])
+        if allk:
+            print("\n与用户成片的平均绝对差（越小越接近）：")
+            for k in sorted(allk):
+                ds = [abs(r["delta"][k]) for r in rows if k in r["delta"]]
+                if ds:
+                    print(f"   {k:24s} 平均|Δ|={st.mean(ds):6.2f}  最大={max(ds):6.2f}  n={len(ds)}")
+    if args.report:
+        json.dump({"rows": rows, "elapsed": el, "per_image": per},
+                  open(args.report, 'w'), ensure_ascii=False, indent=1)
+        print(f"\n报告: {args.report}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

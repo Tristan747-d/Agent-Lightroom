@@ -1,0 +1,272 @@
+{
+ "source": "/Users/tristan/Pictures/Lightroom/2026.9/2026.9.lrcat",
+ "n_total": 47,
+ "branches": {
+  "RAW": {
+   "n": 21,
+   "stats": {
+    "Exposure2012": {
+     "n": 21,
+     "median": 0.33,
+     "p25": 0.06,
+     "p75": 0.48,
+     "min": -0.57,
+     "max": 2.3,
+     "use_rate": 1.0
+    },
+    "Contrast2012": {
+     "n": 21,
+     "median": 7.0,
+     "p25": 6.0,
+     "p75": 7.0,
+     "min": 5.0,
+     "max": 7.0,
+     "use_rate": 1.0
+    },
+    "Highlights2012": {
+     "n": 21,
+     "median": -64.0,
+     "p25": -67.0,
+     "p75": -61.0,
+     "min": -75.0,
+     "max": -53.0,
+     "use_rate": 1.0
+    },
+    "Shadows2012": {
+     "n": 21,
+     "median": 49.0,
+     "p25": 45.0,
+     "p75": 53.0,
+     "min": 39.0,
+     "max": 65.0,
+     "use_rate": 1.0
+    },
+    "Whites2012": {
+     "n": 21,
+     "median": 11.0,
+     "p25": 9.0,
+     "p75": 13.0,
+     "min": 0.0,
+     "max": 36.0,
+     "use_rate": 1.0
+    },
+    "Blacks2012": {
+     "n": 21,
+     "median": -15.0,
+     "p25": -17.0,
+     "p75": -14.0,
+     "min": -22.0,
+     "max": -10.0,
+     "use_rate": 1.0
+    },
+    "Vibrance": {
+     "n": 21,
+     "median": 15.0,
+     "p25": 15.0,
+     "p75": 15.0,
+     "min": 15.0,
+     "max": 15.0,
+     "use_rate": 1.0
+    },
+    "Saturation": {
+     "n": 21,
+     "median": 0.0,
+     "p25": 0.0,
+     "p75": 1.0,
+     "min": -1.0,
+     "max": 2.0,
+     "use_rate": 1.0
+    },
+    "Clarity2012": {
+     "n": 1,
+     "median": 12.0,
+     "p25": 12.0,
+     "p75": 12.0,
+     "min": 12.0,
+     "max": 12.0,
+     "use_rate": 0.048
+    },
+    "Dehaze": {
+     "n": 3,
+     "median": 15.0,
+     "p25": 15.0,
+     "p75": 19.0,
+     "min": 15.0,
+     "max": 19.0,
+     "use_rate": 0.143
+    },
+    "Sharpness": {
+     "n": 21,
+     "median": 40.0,
+     "p25": 40.0,
+     "p75": 40.0,
+     "min": 40.0,
+     "max": 55.0,
+     "use_rate": 1.0
+    },
+    "ColorNoiseReduction": {
+     "n": 21,
+     "median": 25.0,
+     "p25": 25.0,
+     "p75": 25.0,
+     "min": 25.0,
+     "max": 25.0,
+     "use_rate": 1.0
+    },
+    "Temperature": {
+     "n": 21,
+     "median": 5150.0,
+     "p25": 4900.0,
+     "p75": 5300.0,
+     "min": 4650.0,
+     "max": 5400.0,
+     "use_rate": 1.0
+    },
+    "Tint": {
+     "n": 21,
+     "median": 9.0,
+     "p25": 5.0,
+     "p75": 10.0,
+     "min": -10.0,
+     "max": 12.0,
+     "use_rate": 1.0
+    },
+    "LensProfileEnable": {
+     "use_rate": 1.0
+    },
+    "AutoLateralCA": {
+     "use_rate": 1.0
+    },
+    "PerspectiveUpright": {
+     "use_rate": 0.952
+    },
+    "_s_curve_rate": 1.0,
+    "_mask_rate": 1.0
+   }
+  },
+  "JPG": {
+   "n": 26,
+   "stats": {
+    "Exposure2012": {
+     "n": 26,
+     "median": -0.12,
+     "p25": -0.38,
+     "p75": 0.03,
+     "min": -0.61,
+     "max": 1.3,
+     "use_rate": 1.0
+    },
+    "Contrast2012": {
+     "n": 26,
+     "median": 7.0,
+     "p25": 6.0,
+     "p75": 7.0,
+     "min": 0.0,
+     "max": 7.0,
+     "use_rate": 1.0
+    },
+    "Highlights2012": {
+     "n": 26,
+     "median": -8.5,
+     "p25": -52.0,
+     "p75": -1.0,
+     "min": -71.0,
+     "max": 0.0,
+     "use_rate": 1.0
+    },
+    "Shadows2012": {
+     "n": 26,
+     "median": 29.0,
+     "p25": 19.0,
+     "p75": 43.0,
+     "min": 9.0,
+     "max": 100.0,
+     "use_rate": 1.0
+    },
+    "Whites2012": {
+     "n": 26,
+     "median": 10.5,
+     "p25": 6.0,
+     "p75": 13.0,
+     "min": -1.0,
+     "max": 16.0,
+     "use_rate": 1.0
+    },
+    "Blacks2012": {
+     "n": 26,
+     "median": -15.0,
+     "p25": -18.0,
+     "p75": -13.0,
+     "min": -23.0,
+     "max": 0.0,
+     "use_rate": 1.0
+    },
+    "Vibrance": {
+     "n": 26,
+     "median": 14.0,
+     "p25": 13.0,
+     "p75": 16.0,
+     "min": 0.0,
+     "max": 20.0,
+     "use_rate": 1.0
+    },
+    "Saturation": {
+     "n": 26,
+     "median": 1.0,
+     "p25": 0.0,
+     "p75": 2.0,
+     "min": -1.0,
+     "max": 3.0,
+     "use_rate": 1.0
+    },
+    "Clarity2012": {
+     "n": 2,
+     "median": 17.0,
+     "p25": 17.0,
+     "p75": 17.0,
+     "min": 17.0,
+     "max": 17.0,
+     "use_rate": 0.077
+    },
+    "Dehaze": {
+     "n": 2,
+     "median": 21.0,
+     "p25": 21.0,
+     "p75": 21.0,
+     "min": 21.0,
+     "max": 21.0,
+     "use_rate": 0.077
+    },
+    "Sharpness": {
+     "n": 1,
+     "median": 21.0,
+     "p25": 21.0,
+     "p75": 21.0,
+     "min": 21.0,
+     "max": 21.0,
+     "use_rate": 0.038
+    },
+    "LuminanceSmoothing": {
+     "n": 1,
+     "median": 24.0,
+     "p25": 24.0,
+     "p75": 24.0,
+     "min": 24.0,
+     "max": 24.0,
+     "use_rate": 0.038
+    },
+    "LensProfileEnable": {
+     "use_rate": 0.923
+    },
+    "AutoLateralCA": {
+     "use_rate": 0.923
+    },
+    "PerspectiveUpright": {
+     "use_rate": 0.692
+    },
+    "_s_curve_rate": 0.0,
+    "_mask_rate": 0.769
+   }
+  }
+ }
+}
