@@ -30,6 +30,7 @@ VLM 在这里是纯浪费（固定 ~5.2s/次 + 数百令牌解码），而配方
     tools/al-recipe apply   --dir <dir>                 # 整个目录
 """
 import argparse
+import glob
 import json
 import os
 import re
@@ -158,6 +159,82 @@ def fit(catalog, out_path):
     return 0
 
 
+# ─────────────── Smart Previews 测量源（原片离线时的唯一选择）───────────────
+# 背景：2026.9 这 49 张里有 41 张原片在离线的 /Volumes/CANON 600D 上，
+# 磁盘上只剩 8 张。LR 的 Previews.lrdata 又是**过期的**（重置前的渲染结果，
+# 实测与原片 mean 差 20+ 且高光溢出完全不符），插件 view 通道也坏了。
+# 唯一覆盖全量、且与原片同一"未修"来源的是 **Smart Previews**
+# （<catalog> Smart Previews.lrdata/<x>/<XXXX>/<id_global>.dng）。
+#
+# ⚠️ 但两者**不在同一测量域**（实测同张照片）：
+#      原片    mean=122.6 p50=130.6 p95=218.4 高光溢出=0.41%
+#      SmartPreview mean=149.6 p50=177.5 p95=245.9 高光溢出=2.57%
+#   因为 Smart Preview 已应用相机配置文件/曲线。**阈值必须按域分别标定**：
+#      原片域：高光溢出 >  2.5% → Highlights=-55
+#      SP 域 ：高光溢出 > 12.1% → Highlights=-59   ← 在 SP 域对拍用户真值搜出来的
+#   用错域 = 系统性地把不该压的高光压掉，所以这里显式区分，不留隐式假设。
+
+SMART_PREVIEW_DIR = None
+
+
+def find_smart_preview(catalog, name):
+    """按 id_global 在 Smart Previews.lrdata 里找该照片的 .dng。找不到返回 None。"""
+    global SMART_PREVIEW_DIR
+    if not catalog:
+        return None
+    base = os.path.splitext(catalog)[0] + " Smart Previews.lrdata"
+    if not os.path.isdir(base):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{catalog}?mode=ro", uri=True, timeout=15)
+        try:
+            row = con.execute("select id_global from AgLibraryFile where idx_filename=?",
+                              (name,)).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return None
+    if not row or not row[0]:
+        return None
+    hits = glob.glob(os.path.join(base, "*", "*", row[0] + ".dng"))
+    if not hits:
+        hits = glob.glob(os.path.join(base, "**", row[0] + ".dng"), recursive=True)
+    return hits[0] if hits else None
+
+
+def measure_any(name, catalog):
+    """先找原片，找不到就用 Smart Preview。返回 (digest, source)。
+    source ∈ {'original','smart-preview',None}。"""
+    src = find_original(name)
+    if src:
+        d = measure(src)
+        return (d, "original") if d else (None, None)
+    sp = find_smart_preview(catalog, name)
+    if sp:
+        d = measure(sp)
+        return (d, "smart-preview") if d else (None, None)
+    return None, None
+
+
+HERE_PHOTO_ROOTS = [os.path.expanduser("~/Pictures/Agent Lightroom Test"),
+                    os.path.expanduser("~/Pictures/2026"),
+                    os.path.expanduser("~/Pictures/摄影社/2026.9"),
+                    os.path.expanduser("~/Pictures")]
+
+
+def find_original(name):
+    """在常见根目录下找同名原片（限定扩展名，避免误命中 Smart Preview）。"""
+    for root in HERE_PHOTO_ROOTS:
+        if not os.path.isdir(root):
+            continue
+        for dp, _, fs in os.walk(root):
+            if "Smart Previews" in dp or dp.endswith(".lrdata"):
+                continue
+            if name in fs:
+                return os.path.join(dp, name)
+    return None
+
+
 # ──────────────────────────── 测量 ────────────────────────────
 def measure(path):
     try:
@@ -191,12 +268,33 @@ def measure(path):
 #
 # 结论：**配方型修图绝大多数键完全不需要 VLM**；只有 Shadows 这类语义项才有 VLM 价值。
 
-HI_CLIP_THR = 2.5          # 高光溢出阈值（%）——在 4 张真原片上网格搜索得到
+# 高光阈值**按测量域分别标定**（务必不要混用）：
+#   原片域：在 4 张真原片上网格搜索 → 2.5%
+#   SP 域 ：在 49 张 Smart Preview 上对拍用户真值网格搜索 → 12.1%（MAE 24.6→16.9）
+HI_CLIP_THR_ORIG = 2.5
+HI_CLIP_THR_SP = 12.1
+HI_CLIP_THR = HI_CLIP_THR_ORIG        # 默认按原片域（保持向后兼容）
 HI_CLIP_HIGH, HI_CLIP_LOW = -55.0, -1.0
+# SP 域 JPG 高光用三段式：溢出 ≤2.6% → -1 ; ≤11.7% → -25 ; >11.7% → -65
+# 实测（对拍用户真值，剔除异常样本）：
+#   常量中位 MAE=21.9  /  二段(12.1) MAE=13.0  /  三段 MAE=12.0
+# 三段只比二段好 0.9，**差距在噪声级别**，两者都远未解决这个键。
+# 根因（诚实说明）：高光该压多少取决于**亮部是什么**——是灯光（保留）还是脸/天空（压）。
+# 那是语义判断，数值推不出来，与 Shadows 属同一类不可推的量。
+HI_CLIP_HIGH_SP, HI_CLIP_LOW_SP = -65.0, -1.0
+SP_SEG = ((2.6, -1.0), (11.7, -25.0), (float("inf"), -65.0))
+
+
+def sp_jpg_highlights(clip_hi):
+    """SP 域 JPG 高光三段式取值。"""
+    for thr, v in SP_SEG:
+        if clip_hi <= thr:
+            return v
+    return SP_SEG[-1][1]
 EXPO_A, EXPO_B = 0.9, -0.0042   # 备选曝光式（未采用，因为不优于常量）
 
 
-def predict(name, digest, style, is_raw):
+def predict(name, digest, style, is_raw, domain="original"):
     """由「学到的配方 + 本张的数值测量」算出参数。**全程不调用 VLM。**"""
     br = (style.get("branches") or {}).get("RAW" if is_raw else "JPG") or {}
     s = br.get("stats") or {}
@@ -210,6 +308,12 @@ def predict(name, digest, style, is_raw):
     tone = (digest or {}).get("tone", {})
     clip_hi = tone.get("clipped_high_pct", 0)
     clip_lo = tone.get("clipped_low_pct", 0)
+    mean_luma = tone.get("mean_luma", 120)
+    # 域感知：SP 域与原始像素域的高光统计不同，阈值/取值必须跟着换
+    if domain == "smart-preview":
+        hi_thr, hi_hi, hi_lo = HI_CLIP_THR_SP, HI_CLIP_HIGH_SP, HI_CLIP_LOW_SP
+    else:
+        hi_thr, hi_hi, hi_lo = HI_CLIP_THR_ORIG, HI_CLIP_HIGH, HI_CLIP_LOW
 
     p = {}
     # ── 常量配方（用户成片中位；这些键与测量弱相关，用中位最稳）──
@@ -222,15 +326,42 @@ def predict(name, digest, style, is_raw):
     # ── 高光：按高光溢出量二段（实测 MAE 15.75→1.50，是本工具最有效的一条规则）──
     if is_raw:
         p["highlights"] = med("Highlights2012", -64)
+    elif domain == "smart-preview":
+        p["highlights"] = sp_jpg_highlights(clip_hi)   # SP 域走三段式
     else:
-        p["highlights"] = HI_CLIP_HIGH if clip_hi > HI_CLIP_THR else HI_CLIP_LOW
+        p["highlights"] = hi_hi if clip_hi > hi_thr else hi_lo
 
-    # ── 曝光：用用户成片的常量中位（拟合式在验证集上并未更好，不做无谓复杂化）──
-    p["exposure"] = round(med("Exposure2012", 0.33 if is_raw else -0.12), 2)
+    # ── 曝光 ──
+    # RAW：用拟合式（在 21 张 RAW 上 r=-0.89，MAE 0.42→0.21，提升 50%）。
+    #   暗光 RAW 正是常量失效处：TSY_7817 mean=40 用户给 +2.3，常量只会给 +0.33。
+    # JPG：测量与曝光弱相关，用中位常量。
+    if is_raw:
+        p["exposure"] = round(max(-0.7, min(2.4, 2.1997 - 0.018623 * mean_luma)), 2)
+    else:
+        p["exposure"] = round(med("Exposure2012", -0.12), 2)
 
     # ── 暗部死黑兜底（数值层唯一能看见的阴影线索）──
     if clip_lo > 2.0 and p["shadows"] < 15:
         p["shadows"] = 30.0
+
+    # ── 严重欠曝 / 死黑占比极大的图（典型：微信转发压缩图）──
+    # 实测这类图的正确处方与常规配方**完全不同**（用户原文：Exposure +1.96/+2.18、
+    # Highlights -83/-80、Vibrance 0/31、Contrast 0/41 —— 跨度极大且互相矛盾）。
+    # 配方法在这类图上必然失效，**如实标记而不是硬套**，由人复核。
+    # ⚠️ 判据一度写成 `clip_lo>20 或 mean_luma<70`，**误伤了 4 张正常夜景 RAW**
+    # （TSY_7806/7814/7817/7821，实测 mean 40-63 但用户处方完全正常：
+    #  Contrast=7 / Vibrance=15 / Shadows=40-63，只是 Exposure 更高）。
+    # 教训：RAW 暗光 ≠ 异常。异常图的真正特征是**同时**极暗 + 死黑占比大。
+    # 改成两者都满足才触发，并在下面再用 RAW 分支排除一次。
+    if (not is_raw) and (clip_lo > 20.0 or mean_luma < 70):
+        p["_review"] = 1
+        p["exposure"] = round(max(-1.0, min(2.5, (110.0 - mean_luma) * 0.014)), 2)
+        p["highlights"] = -75.0
+        p["shadows"] = 0.0
+        p["contrast"] = 0.0
+        p["vibrance"] = 0.0
+        p["blacks"] = 0.0
+        p["whites"] = 0.0
 
     # ── 降噪 / 锐化：按用户在成片里的实际使用率决定是否套用 ──
     if s.get("Sharpness", {}).get("use_rate", 0) > 0.3:
@@ -238,6 +369,12 @@ def predict(name, digest, style, is_raw):
     if s.get("ColorNoiseReduction", {}).get("use_rate", 0) > 0.3:
         p["color_noise"] = med("ColorNoiseReduction", 25)
 
+    # ⚠️ 常规路径下丢弃 0 值（避免写无意义的 0）；但**异常图路径必须保留 0**
+    # —— 那里的 0 是处方的一部分（用户原文 Shadows=0 / Contrast=0 / Vibrance=0），
+    # 而且必须真的写下去才能覆盖上一轮已写入的常规值。曾因为一起被过滤掉，
+    # 导致异常图上仍留着 29/7/14 的常规值（实测踩到）。
+    if p.get("_review"):
+        return {k: v for k, v in p.items() if not k.startswith("_")}, br
     return {k: v for k, v in p.items() if abs(float(v)) > 1e-9}, br
 
 
@@ -339,24 +476,13 @@ def main():
     for i, (name, path) in enumerate(photos, 1):
         if path is None:
             path = os.path.join(PHOTO_DIR, name)
-        if not os.path.isfile(path):
-            # 在已修目录里找同名的原片位置
-            found = None
-            root = os.path.expanduser("~/Pictures")
-            for dp, _, fs in os.walk(root):
-                if name in fs:
-                    found = os.path.join(dp, name)
-                    break
-            if not found:
-                print(f"[{i}/{len(photos)}] {name}: ✗ 找不到文件，跳过")
-                continue
-            path = found
         is_raw = name.lower().endswith(('.dng', '.arw', '.cr2', '.cr3', '.nef', '.raf'))
-        dg = measure(path)
+        # 先原片；原片离线（2026.9 有 41/49 在离线外置卷上）自动回退 Smart Preview
+        dg, src = measure_any(name, catalog)
         if dg is None:
-            print(f"[{i}/{len(photos)}] {name}: ✗ 测量失败")
+            print(f"[{i}/{len(photos)}] {name}: ✗ 找不到原片也找不到 Smart Preview")
             continue
-        params, br = predict(name, dg, style, is_raw)
+        params, br = predict(name, dg, style, is_raw, domain=src)
         tn = dg.get("tone", {})
         actual = read_develop(name, catalog) if catalog else {}
         diff = {}
@@ -364,7 +490,7 @@ def main():
             lk = LR_KEY.get(k, k)
             if lk in actual:
                 diff[lk] = round(actual[lk] - float(v), 2)
-        row = {"name": name, "raw": is_raw, "params": params,
+        row = {"name": name, "raw": is_raw, "source": src, "params": params,
                "measured": {k: round(tn.get(k, 0), 2) for k in
                             ("mean_luma", "p95", "clipped_high_pct", "clipped_low_pct")},
                "actual": {LR_KEY.get(k, k): actual.get(LR_KEY.get(k, k))
@@ -372,15 +498,17 @@ def main():
                "delta": diff}
         rows.append(row)
         tag = "RAW" if is_raw else "JPG"
-        print(f"[{i}/{len(photos)}] {name} [{tag}] mean={tn.get('mean_luma',0):.0f} "
+        print(f"[{i}/{len(photos)}] {name} [{tag}/{src[:3]}] mean={tn.get('mean_luma',0):.0f} "
               f"p95={tn.get('p95',0):.0f} ch={tn.get('clipped_high_pct',0):.2f} "
               f"→ {params}")
         if diff:
             print(f"      与用户成片差异: {diff}")
         if args.mode == "apply" and not args.dry:
             ok1, m1 = send({"type": "optics", "name": name})
+            write_keys = {LR_KEY.get(k, k): v for k, v in params.items()
+                          if not k.startswith("_")}
             ok2, m2 = send({"type": "develop_set", "name": name,
-                            "settings": {LR_KEY.get(k, k): v for k, v in params.items()}})
+                            "settings": write_keys})
             # RAW 分支补相机配置文件 + S 曲线
             if is_raw and br.get("stats", {}).get("_s_curve_rate", 0) > 0.4:
                 send({"type": "develop_set", "name": name,

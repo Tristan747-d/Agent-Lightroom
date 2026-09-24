@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""al-recipe-validate —— 把 al-recipe 的预测与**用户原成片参数**逐键对拍。
+
+为什么需要单独一个工具：al-recipe 自带的 `delta` 是拿预测和**当前 catalog 状态**比，
+而用户在 2026-09-24 把 49 张全部重置了 —— 于是那个 delta 变成"预测值减去 0"，
+永远等于预测值本身，毫无信息量（实测就是这么误导人的）。
+真正要比的是**重置前的用户成片参数**，已存于 ground-truth/2026.9-original-edits.json。
+
+用法:
+    tools/al-recipe-validate --predict /tmp/validate49b.json \
+        --truth ground-truth/2026.9-original-edits.json
+"""
+import argparse, json, os, statistics as st, sys
+
+MAP = {"contrast": "Contrast2012", "vibrance": "Vibrance", "blacks": "Blacks2012",
+       "whites": "Whites2012", "shadows": "Shadows2012", "highlights": "Highlights2012",
+       "exposure": "Exposure2012", "sharpness": "Sharpness",
+       "color_noise": "ColorNoiseReduction", "temperature": "IncrementalTemperature",
+       "tint": "IncrementalTint"}
+
+# 异常样本：微信转发图（LR 里被额外狠压）与中秋-7/8（非本机拍摄的已处理图）
+def is_odd(n):
+    return ("微信图片" in n) or n in ("中秋节活动 摄影社-7.jpg", "中秋节活动 摄影社-8.jpg")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--predict", required=True)
+    ap.add_argument("--truth", default="ground-truth/2026.9-original-edits.json")
+    ap.add_argument("--by-branch", action="store_true", help="按 RAW/JPG 分开报")
+    args = ap.parse_args()
+
+    truth = {r["_file"]: r for r in json.load(open(args.truth))}
+    rep = json.load(open(args.predict))
+    rows = [r for r in rep.get("rows", []) if r.get("params")]
+
+    per = {}
+    detail = {}
+    for r in rows:
+        gt = truth.get(r["name"])
+        if not gt:
+            continue
+        for pk, lk in MAP.items():
+            if pk not in r["params"] or gt.get(lk) is None:
+                continue
+            per.setdefault(lk, []).append(
+                (abs(r["params"][pk] - gt[lk]), r["name"], r["params"][pk], gt[lk],
+                 is_odd(r["name"]), r.get("raw", False)))
+            detail.setdefault(lk, []).append(
+                {"name": r["name"], "pred": r["params"][pk], "user": gt[lk],
+                 "raw": r.get("raw", False)})
+
+    print(f"对拍 {len(rows)} 张（真值来自 {args.truth}）\n")
+    print(f"{'键':22s}{'n':>4s}{'全部MAE':>9s}{'剔除异常':>10s}{'中位|Δ|':>9s}")
+    for lk, v in sorted(per.items()):
+        allm = st.mean([a for a, *_ in v])
+        clean = [a for a, _, _, _, odd, _ in v if not odd]
+        cm = st.mean(clean) if clean else float("nan")
+        md = st.median(clean) if clean else float("nan")
+        print(f"{lk:22s}{len(v):4d}{allm:9.2f}{cm:10.2f}{md:9.2f}")
+
+    if args.by_branch:
+        print("\n按 RAW/JPG 分开：")
+        for lk in sorted(per):
+            for tag, want in (("RAW", True), ("JPG", False)):
+                vals = [a for a, _, _, _, odd, raw in per[lk] if raw == want and not odd]
+                if vals:
+                    print(f"   {lk:20s} {tag}: n={len(vals):3d} MAE={st.mean(vals):6.2f}")
+
+    # 最差的 8 个样本，便于看系统性偏差
+    print("\n误差最大的样本（Highlights）：")
+    for a, n, p, u, odd, raw in sorted(per.get("Highlights2012", []), reverse=True)[:8]:
+        print(f"   {n[:32]:34s} 我给={p:6g} 用户={u:6g} Δ={a:5.1f}"
+              f"{'  RAW' if raw else ''}{'  (异常样本)' if odd else ''}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

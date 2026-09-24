@@ -1,0 +1,933 @@
+[
+ {
+  "file": "TSY_7817.dng",
+  "tone": {
+   "clipped_high_pct": 0.0,
+   "clipped_low_pct": 15.6857,
+   "contrast_std": 30.8898,
+   "mean_luma": 40.3963,
+   "p1": 0.2126,
+   "p5": 0.9278,
+   "p50": 35.4618,
+   "p95": 96.377,
+   "p99": 117.9466
+  },
+  "user_Highlights": -58.0,
+  "user_Exposure": 2.3,
+  "user_Shadows": 39.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7841.dng",
+  "tone": {
+   "clipped_high_pct": 2.5041,
+   "clipped_low_pct": 0.173,
+   "contrast_std": 66.1838,
+   "mean_luma": 130.9113,
+   "p1": 12.1054,
+   "p5": 24.1524,
+   "p50": 141.35,
+   "p95": 226.442,
+   "p99": 254.9278
+  },
+  "user_Highlights": -66.0,
+  "user_Exposure": -0.2,
+  "user_Shadows": 45.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7821.dng",
+  "tone": {
+   "clipped_high_pct": 0.0115,
+   "clipped_low_pct": 27.9114,
+   "contrast_std": 61.7671,
+   "mean_luma": 54.4883,
+   "p1": 0.0722,
+   "p5": 0.1444,
+   "p50": 35.4092,
+   "p95": 185.6378,
+   "p99": 215.2126
+  },
+  "user_Highlights": -67.0,
+  "user_Exposure": 0.8,
+  "user_Shadows": 54.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7828.dng",
+  "tone": {
+   "clipped_high_pct": 4.4252,
+   "clipped_low_pct": 3.9114,
+   "contrast_std": 67.7698,
+   "mean_luma": 103.7535,
+   "p1": 0.1444,
+   "p5": 8.5616,
+   "p50": 94.6744,
+   "p95": 248.2086,
+   "p99": 254.2126
+  },
+  "user_Highlights": -69.0,
+  "user_Exposure": 0.33,
+  "user_Shadows": 47.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7822.dng",
+  "tone": {
+   "clipped_high_pct": 8.1676,
+   "clipped_low_pct": 0.0,
+   "contrast_std": 72.914,
+   "mean_luma": 141.5055,
+   "p1": 23.7232,
+   "p5": 30.6366,
+   "p50": 150.0194,
+   "p95": 254.9278,
+   "p99": 255.0
+  },
+  "user_Highlights": -71.0,
+  "user_Exposure": -0.41,
+  "user_Shadows": 48.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7807.dng",
+  "tone": {
+   "clipped_high_pct": 0.0029,
+   "clipped_low_pct": 5.7614,
+   "contrast_std": 52.5283,
+   "mean_luma": 82.0993,
+   "p1": 0.4252,
+   "p5": 4.1352,
+   "p50": 85.707,
+   "p95": 164.381,
+   "p99": 192.012
+  },
+  "user_Highlights": -63.0,
+  "user_Exposure": 0.63,
+  "user_Shadows": 57.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7825.dng",
+  "tone": {
+   "clipped_high_pct": 1.771,
+   "clipped_low_pct": 9.4684,
+   "contrast_std": 67.8785,
+   "mean_luma": 87.592,
+   "p1": 0.0722,
+   "p5": 0.5014,
+   "p50": 82.075,
+   "p95": 230.2086,
+   "p99": 254.0
+  },
+  "user_Highlights": -66.0,
+  "user_Exposure": 0.48,
+  "user_Shadows": 53.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7833.dng",
+  "tone": {
+   "clipped_high_pct": 0.1323,
+   "clipped_low_pct": 0.1701,
+   "contrast_std": 58.4377,
+   "mean_luma": 78.9353,
+   "p1": 8.2888,
+   "p5": 15.706,
+   "p50": 57.5878,
+   "p95": 194.1294,
+   "p99": 230.4452
+  },
+  "user_Highlights": -63.0,
+  "user_Exposure": 0.42,
+  "user_Shadows": 50.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7823.dng",
+  "tone": {
+   "clipped_high_pct": 9.729,
+   "clipped_low_pct": 0.0,
+   "contrast_std": 73.8251,
+   "mean_luma": 141.4735,
+   "p1": 23.1306,
+   "p5": 30.3954,
+   "p50": 146.6732,
+   "p95": 254.9278,
+   "p99": 255.0
+  },
+  "user_Highlights": -75.0,
+  "user_Exposure": -0.57,
+  "user_Shadows": 53.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7824.dng",
+  "tone": {
+   "clipped_high_pct": 1.1753,
+   "clipped_low_pct": 9.2444,
+   "contrast_std": 63.83,
+   "mean_luma": 85.7759,
+   "p1": 0.0722,
+   "p5": 0.8596,
+   "p50": 82.1272,
+   "p95": 211.9656,
+   "p99": 252.7192
+  },
+  "user_Highlights": -66.0,
+  "user_Exposure": 0.43,
+  "user_Shadows": 57.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7814.dng",
+  "tone": {
+   "clipped_high_pct": 0.0246,
+   "clipped_low_pct": 14.1043,
+   "contrast_std": 39.3326,
+   "mean_luma": 45.0448,
+   "p1": 0.0,
+   "p5": 0.4252,
+   "p50": 40.7334,
+   "p95": 116.9632,
+   "p99": 182.1496
+  },
+  "user_Highlights": -64.0,
+  "user_Exposure": 0.99,
+  "user_Shadows": 63.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7838.dng",
+  "tone": {
+   "clipped_high_pct": 0.4147,
+   "clipped_low_pct": 1.1925,
+   "contrast_std": 59.3597,
+   "mean_luma": 116.9912,
+   "p1": 4.5656,
+   "p5": 16.7874,
+   "p50": 115.288,
+   "p95": 214.7794,
+   "p99": 241.8516
+  },
+  "user_Highlights": -53.0,
+  "user_Exposure": 0.28,
+  "user_Shadows": 41.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7834.dng",
+  "tone": {
+   "clipped_high_pct": 0.0808,
+   "clipped_low_pct": 0.2583,
+   "contrast_std": 60.3117,
+   "mean_luma": 80.4611,
+   "p1": 8.1484,
+   "p5": 15.2808,
+   "p50": 58.223,
+   "p95": 200.004,
+   "p99": 235.2286
+  },
+  "user_Highlights": -61.0,
+  "user_Exposure": 0.41,
+  "user_Shadows": 49.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7843.dng",
+  "tone": {
+   "clipped_high_pct": 5.7861,
+   "clipped_low_pct": 0.3173,
+   "contrast_std": 68.7116,
+   "mean_luma": 132.9284,
+   "p1": 12.3954,
+   "p5": 31.9152,
+   "p50": 120.6178,
+   "p95": 252.1496,
+   "p99": 255.0
+  },
+  "user_Highlights": -73.0,
+  "user_Exposure": -0.09,
+  "user_Shadows": 40.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7837.dng",
+  "tone": {
+   "clipped_high_pct": 1.2727,
+   "clipped_low_pct": 0.0109,
+   "contrast_std": 67.3977,
+   "mean_luma": 124.5246,
+   "p1": 12.004,
+   "p5": 18.8596,
+   "p50": 127.2528,
+   "p95": 238.9358,
+   "p99": 251.4986
+  },
+  "user_Highlights": -67.0,
+  "user_Exposure": -0.01,
+  "user_Shadows": 52.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7806.dng",
+  "tone": {
+   "clipped_high_pct": 0.0,
+   "clipped_low_pct": 7.8051,
+   "contrast_std": 38.9145,
+   "mean_luma": 62.5605,
+   "p1": 0.1444,
+   "p5": 1.5656,
+   "p50": 62.8464,
+   "p95": 132.2888,
+   "p99": 148.8034
+  },
+  "user_Highlights": -60.0,
+  "user_Exposure": 1.52,
+  "user_Shadows": 40.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7812.dng",
+  "tone": {
+   "clipped_high_pct": 0.1174,
+   "clipped_low_pct": 4.0603,
+   "contrast_std": 60.5486,
+   "mean_luma": 120.8716,
+   "p1": 0.357,
+   "p5": 6.4292,
+   "p50": 133.5704,
+   "p95": 198.639,
+   "p99": 233.6578
+  },
+  "user_Highlights": -60.0,
+  "user_Exposure": 0.11,
+  "user_Shadows": 41.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7827.dng",
+  "tone": {
+   "clipped_high_pct": 0.1008,
+   "clipped_low_pct": 2.2263,
+   "contrast_std": 62.2843,
+   "mean_luma": 113.9562,
+   "p1": 3.0842,
+   "p5": 9.5346,
+   "p50": 121.6538,
+   "p95": 202.4452,
+   "p99": 225.2872
+  },
+  "user_Highlights": -61.0,
+  "user_Exposure": 0.06,
+  "user_Shadows": 50.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7819.dng",
+  "tone": {
+   "clipped_high_pct": 0.0246,
+   "clipped_low_pct": 4.4023,
+   "contrast_std": 63.688,
+   "mean_luma": 92.3306,
+   "p1": 0.4974,
+   "p5": 6.6378,
+   "p50": 79.546,
+   "p95": 220.996,
+   "p99": 240.0722
+  },
+  "user_Highlights": -64.0,
+  "user_Exposure": 0.21,
+  "user_Shadows": 65.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7813.dng",
+  "tone": {
+   "clipped_high_pct": 1.3082,
+   "clipped_low_pct": 3.6714,
+   "contrast_std": 55.5214,
+   "mean_luma": 105.7458,
+   "p1": 0.4292,
+   "p5": 7.3702,
+   "p50": 111.217,
+   "p95": 191.2046,
+   "p99": 253.4304
+  },
+  "user_Highlights": -66.0,
+  "user_Exposure": 0.11,
+  "user_Shadows": 46.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "TSY_7818.dng",
+  "tone": {
+   "clipped_high_pct": 0.0298,
+   "clipped_low_pct": 2.2899,
+   "contrast_std": 52.6108,
+   "mean_luma": 101.0291,
+   "p1": 2.1404,
+   "p5": 10.2126,
+   "p50": 104.8488,
+   "p95": 186.734,
+   "p99": 202.6538
+  },
+  "user_Highlights": -59.0,
+  "user_Exposure": 0.34,
+  "user_Shadows": 48.0,
+  "user_Vibrance": 15.0,
+  "raw": true
+ },
+ {
+  "file": "IMG_7275.JPG",
+  "tone": {
+   "clipped_high_pct": 15.2619,
+   "clipped_low_pct": 2.1227,
+   "contrast_std": 87.3627,
+   "mean_luma": 162.943,
+   "p1": 3.1404,
+   "p5": 8.0,
+   "p50": 199.2194,
+   "p95": 254.0,
+   "p99": 255.0
+  },
+  "user_Highlights": -68.0,
+  "user_Exposure": 0.03,
+  "user_Shadows": 38.0,
+  "user_Vibrance": 19.0,
+  "raw": false
+ },
+ {
+  "file": "IMG_7276.JPG",
+  "tone": {
+   "clipped_high_pct": 6.2615,
+   "clipped_low_pct": 3.105,
+   "contrast_std": 79.7166,
+   "mean_luma": 158.5406,
+   "p1": 1.2928,
+   "p5": 8.5708,
+   "p50": 191.5552,
+   "p95": 252.4344,
+   "p99": 255.0
+  },
+  "user_Highlights": -12.0,
+  "user_Exposure": 0.01,
+  "user_Shadows": 45.0,
+  "user_Vibrance": 19.0,
+  "raw": false
+ },
+ {
+  "file": "IMG_7279.JPG",
+  "tone": {
+   "clipped_high_pct": 2.0373,
+   "clipped_low_pct": 1.2738,
+   "contrast_std": 85.2105,
+   "mean_luma": 163.0004,
+   "p1": 4.0,
+   "p5": 15.1364,
+   "p50": 202.0808,
+   "p95": 248.004,
+   "p99": 250.9318
+  },
+  "user_Highlights": -1.0,
+  "user_Exposure": 0.01,
+  "user_Shadows": 30.0,
+  "user_Vibrance": 18.0,
+  "raw": false
+ },
+ {
+  "file": "IMG_7280.JPG",
+  "tone": {
+   "clipped_high_pct": 14.9669,
+   "clipped_low_pct": 0.0,
+   "contrast_std": 53.0302,
+   "mean_luma": 206.621,
+   "p1": 43.0578,
+   "p5": 87.2046,
+   "p50": 227.6452,
+   "p95": 255.0,
+   "p99": 255.0
+  },
+  "user_Highlights": -71.0,
+  "user_Exposure": -0.51,
+  "user_Shadows": 9.0,
+  "user_Vibrance": 20.0,
+  "raw": false
+ },
+ {
+  "file": "IMG_7285.JPG",
+  "tone": {
+   "clipped_high_pct": 8.9655,
+   "clipped_low_pct": 0.0017,
+   "contrast_std": 69.9907,
+   "mean_luma": 192.0907,
+   "p1": 16.4212,
+   "p5": 34.4842,
+   "p50": 226.883,
+   "p95": 252.7192,
+   "p99": 254.7874
+  },
+  "user_Highlights": -2.0,
+  "user_Exposure": -0.28,
+  "user_Shadows": 16.0,
+  "user_Vibrance": 17.0,
+  "raw": false
+ },
+ {
+  "file": "IMG_7287.JPG",
+  "tone": {
+   "clipped_high_pct": 9.6757,
+   "clipped_low_pct": 0.016,
+   "contrast_std": 75.7418,
+   "mean_luma": 188.048,
+   "p1": 18.8464,
+   "p5": 33.341,
+   "p50": 226.1858,
+   "p95": 252.647,
+   "p99": 254.7874
+  },
+  "user_Highlights": -2.0,
+  "user_Exposure": -0.38,
+  "user_Shadows": 19.0,
+  "user_Vibrance": 17.0,
+  "raw": false
+ },
+ {
+  "file": "IMG_7290.JPG",
+  "tone": {
+   "clipped_high_pct": 14.8426,
+   "clipped_low_pct": 0.0,
+   "contrast_std": 73.7919,
+   "mean_luma": 179.7911,
+   "p1": 22.4974,
+   "p5": 31.2768,
+   "p50": 198.2418,
+   "p95": 255.0,
+   "p99": 255.0
+  },
+  "user_Highlights": -59.0,
+  "user_Exposure": -0.37,
+  "user_Shadows": 21.0,
+  "user_Vibrance": 14.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4439.JPG",
+  "tone": {
+   "clipped_high_pct": 7.7942,
+   "clipped_low_pct": 2.3827,
+   "contrast_std": 85.2886,
+   "mean_luma": 166.2828,
+   "p1": 0.8596,
+   "p5": 15.263,
+   "p50": 208.4406,
+   "p95": 251.2218,
+   "p99": 253.3622
+  },
+  "user_Highlights": -11.0,
+  "user_Exposure": -0.3,
+  "user_Shadows": 19.0,
+  "user_Vibrance": 14.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4438.JPG",
+  "tone": {
+   "clipped_high_pct": 13.6117,
+   "clipped_low_pct": 0.0,
+   "contrast_std": 47.5016,
+   "mean_luma": 218.4282,
+   "p1": 34.4894,
+   "p5": 106.0204,
+   "p50": 235.3948,
+   "p95": 253.2126,
+   "p99": 255.0
+  },
+  "user_Highlights": -38.0,
+  "user_Exposure": -0.49,
+  "user_Shadows": 29.0,
+  "user_Vibrance": 15.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4440.JPG",
+  "tone": {
+   "clipped_high_pct": 0.2692,
+   "clipped_low_pct": 1.5866,
+   "contrast_std": 63.8377,
+   "mean_luma": 161.4446,
+   "p1": 2.7152,
+   "p5": 23.004,
+   "p50": 184.3856,
+   "p95": 229.5616,
+   "p99": 244.8596
+  },
+  "user_Highlights": -7.0,
+  "user_Exposure": 0.08,
+  "user_Shadows": 28.0,
+  "user_Vibrance": 14.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4444.JPG",
+  "tone": {
+   "clipped_high_pct": 2.6611,
+   "clipped_low_pct": 0.1094,
+   "contrast_std": 59.7558,
+   "mean_luma": 190.988,
+   "p1": 12.9146,
+   "p5": 28.5616,
+   "p50": 207.4102,
+   "p95": 246.0562,
+   "p99": 253.7874
+  },
+  "user_Highlights": -10.0,
+  "user_Exposure": -0.3,
+  "user_Shadows": 26.0,
+  "user_Vibrance": 12.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4448.JPG",
+  "tone": {
+   "clipped_high_pct": 5.817,
+   "clipped_low_pct": 7.4706,
+   "contrast_std": 89.3536,
+   "mean_luma": 114.6846,
+   "p1": 0.0722,
+   "p5": 0.2848,
+   "p50": 93.8624,
+   "p95": 250.9238,
+   "p99": 255.0
+  },
+  "user_Highlights": -71.0,
+  "user_Exposure": 0.13,
+  "user_Shadows": 45.0,
+  "user_Vibrance": 15.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4450.JPG",
+  "tone": {
+   "clipped_high_pct": 1.3718,
+   "clipped_low_pct": 0.2755,
+   "contrast_std": 78.6391,
+   "mean_luma": 171.0048,
+   "p1": 13.4716,
+   "p5": 24.6378,
+   "p50": 205.6784,
+   "p95": 246.7232,
+   "p99": 250.7152
+  },
+  "user_Highlights": -2.0,
+  "user_Exposure": -0.13,
+  "user_Shadows": 29.0,
+  "user_Vibrance": 16.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4452.JPG",
+  "tone": {
+   "clipped_high_pct": 12.7675,
+   "clipped_low_pct": 0.0,
+   "contrast_std": 48.3742,
+   "mean_luma": 215.4902,
+   "p1": 45.7112,
+   "p5": 85.984,
+   "p50": 233.9106,
+   "p95": 255.0,
+   "p99": 255.0
+  },
+  "user_Highlights": -59.0,
+  "user_Exposure": -0.56,
+  "user_Shadows": 28.0,
+  "user_Vibrance": 14.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4457.JPG",
+  "tone": {
+   "clipped_high_pct": 3.4692,
+   "clipped_low_pct": 2.5677,
+   "contrast_std": 88.1257,
+   "mean_luma": 143.4904,
+   "p1": 1.1404,
+   "p5": 8.5708,
+   "p50": 169.8558,
+   "p95": 245.9158,
+   "p99": 253.9278
+  },
+  "user_Highlights": -40.0,
+  "user_Exposure": 0.16,
+  "user_Shadows": 45.0,
+  "user_Vibrance": 13.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4458.JPG",
+  "tone": {
+   "clipped_high_pct": 9.0858,
+   "clipped_low_pct": 0.0,
+   "contrast_std": 51.8711,
+   "mean_luma": 198.7149,
+   "p1": 39.3904,
+   "p5": 74.1246,
+   "p50": 204.2074,
+   "p95": 255.0,
+   "p99": 255.0
+  },
+  "user_Highlights": -64.0,
+  "user_Exposure": -0.57,
+  "user_Shadows": 20.0,
+  "user_Vibrance": 13.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4459.JPG",
+  "tone": {
+   "clipped_high_pct": 11.6752,
+   "clipped_low_pct": 0.0,
+   "contrast_std": 58.3915,
+   "mean_luma": 198.0803,
+   "p1": 33.773,
+   "p5": 72.8492,
+   "p50": 225.5786,
+   "p95": 252.9278,
+   "p99": 254.7874
+  },
+  "user_Highlights": -15.0,
+  "user_Exposure": -0.61,
+  "user_Shadows": 14.0,
+  "user_Vibrance": 10.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4461.JPG",
+  "tone": {
+   "clipped_high_pct": 0.8036,
+   "clipped_low_pct": 0.0596,
+   "contrast_std": 66.887,
+   "mean_luma": 164.7784,
+   "p1": 19.9942,
+   "p5": 39.3318,
+   "p50": 179.6726,
+   "p95": 245.357,
+   "p99": 249.8596
+  },
+  "user_Highlights": 0.0,
+  "user_Exposure": -0.06,
+  "user_Shadows": 16.0,
+  "user_Vibrance": 14.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4462.JPG",
+  "tone": {
+   "clipped_high_pct": 0.6741,
+   "clipped_low_pct": 0.0859,
+   "contrast_std": 67.0973,
+   "mean_luma": 165.7123,
+   "p1": 19.9942,
+   "p5": 41.5076,
+   "p50": 180.8118,
+   "p95": 245.5696,
+   "p99": 249.8596
+  },
+  "user_Highlights": 0.0,
+  "user_Exposure": -0.11,
+  "user_Shadows": 15.0,
+  "user_Vibrance": 14.0,
+  "raw": false
+ },
+ {
+  "file": "WYL_4466.JPG",
+  "tone": {
+   "clipped_high_pct": 0.4972,
+   "clipped_low_pct": 2.8438,
+   "contrast_std": 70.8276,
+   "mean_luma": 136.3154,
+   "p1": 0.0722,
+   "p5": 12.2218,
+   "p50": 148.5256,
+   "p95": 244.651,
+   "p99": 248.7914
+  },
+  "user_Highlights": -5.0,
+  "user_Exposure": 0.25,
+  "user_Shadows": 34.0,
+  "user_Vibrance": 15.0,
+  "raw": false
+ },
+ {
+  "file": "IMG_1426.JPG",
+  "tone": {
+   "clipped_high_pct": 8.9924,
+   "clipped_low_pct": 0.1403,
+   "contrast_std": 67.2061,
+   "mean_luma": 188.327,
+   "p1": 17.7862,
+   "p5": 38.31,
+   "p50": 217.1468,
+   "p95": 253.4344,
+   "p99": 255.0
+  },
+  "user_Highlights": -52.0,
+  "user_Exposure": -0.38,
+  "user_Shadows": 30.0,
+  "user_Vibrance": 10.0,
+  "raw": false
+ },
+ {
+  "file": "IMG_1415.JPG",
+  "tone": {
+   "clipped_high_pct": 2.5671,
+   "clipped_low_pct": 2.5952,
+   "contrast_std": 81.9523,
+   "mean_luma": 149.5723,
+   "p1": 2.2808,
+   "p5": 10.7926,
+   "p50": 177.5052,
+   "p95": 245.945,
+   "p99": 253.5748
+  },
+  "user_Highlights": -1.0,
+  "user_Exposure": -0.08,
+  "user_Shadows": 43.0,
+  "user_Vibrance": 13.0,
+  "raw": false
+ },
+ {
+  "file": "IMG_1415-2.JPG",
+  "tone": {
+   "clipped_high_pct": 2.5671,
+   "clipped_low_pct": 2.5952,
+   "contrast_std": 81.9523,
+   "mean_luma": 149.5723,
+   "p1": 2.2808,
+   "p5": 10.7926,
+   "p50": 177.5052,
+   "p95": 245.945,
+   "p99": 253.5748
+  },
+  "user_Highlights": -1.0,
+  "user_Exposure": -0.08,
+  "user_Shadows": 43.0,
+  "user_Vibrance": 13.0,
+  "raw": false
+ },
+ {
+  "file": "IMG_1416.JPG",
+  "tone": {
+   "clipped_high_pct": 1.7555,
+   "clipped_low_pct": 3.4692,
+   "contrast_std": 83.5847,
+   "mean_luma": 151.0322,
+   "p1": 2.008,
+   "p5": 9.949,
+   "p50": 175.8938,
+   "p95": 247.5456,
+   "p99": 251.584
+  },
+  "user_Highlights": -4.0,
+  "user_Exposure": -0.23,
+  "user_Shadows": 47.0,
+  "user_Vibrance": 14.0,
+  "raw": false
+ },
+ {
+  "file": "微信图片_20260923224207_759_151.jpg",
+  "tone": {
+   "clipped_high_pct": 0.2699,
+   "clipped_low_pct": 33.6846,
+   "contrast_std": 65.5056,
+   "mean_luma": 45.2179,
+   "p1": 0.0,
+   "p5": 0.7874,
+   "p50": 11.732,
+   "p95": 202.0552,
+   "p99": 228.4156
+  },
+  "user_Highlights": -83.0,
+  "user_Exposure": 1.96,
+  "user_Shadows": 0.0,
+  "user_Vibrance": 0.0,
+  "raw": false
+ },
+ {
+  "file": "微信图片_20260923224613_765_151.jpg",
+  "tone": {
+   "clipped_high_pct": 0.2858,
+   "clipped_low_pct": 38.3866,
+   "contrast_std": 61.0022,
+   "mean_luma": 35.1411,
+   "p1": 0.7152,
+   "p5": 0.9278,
+   "p50": 8.152,
+   "p95": 215.5238,
+   "p99": 245.5962
+  },
+  "user_Highlights": -80.0,
+  "user_Exposure": 2.18,
+  "user_Shadows": -14.0,
+  "user_Vibrance": 31.0,
+  "raw": false
+ },
+ {
+  "file": "中秋节活动 摄影社-7.jpg",
+  "tone": {
+   "clipped_high_pct": 8.4907,
+   "clipped_low_pct": 1.7481,
+   "contrast_std": 71.4653,
+   "mean_luma": 190.9828,
+   "p1": 1.7822,
+   "p5": 19.7862,
+   "p50": 221.2368,
+   "p95": 251.8596,
+   "p99": 253.7874
+  },
+  "user_Highlights": 0.0,
+  "user_Exposure": 1.3,
+  "user_Shadows": 100.0,
+  "user_Vibrance": 0.0,
+  "raw": false
+ },
+ {
+  "file": "中秋节活动 摄影社-8.jpg",
+  "tone": {
+   "clipped_high_pct": 0.3454,
+   "clipped_low_pct": 0.9777,
+   "contrast_std": 79.3966,
+   "mean_luma": 171.3136,
+   "p1": 5.0642,
+   "p5": 11.1914,
+   "p50": 209.3768,
+   "p95": 244.937,
+   "p99": 248.2218
+  },
+  "user_Highlights": 0.0,
+  "user_Exposure": 1.3,
+  "user_Shadows": 100.0,
+  "user_Vibrance": 0.0,
+  "raw": false
+ }
+]
